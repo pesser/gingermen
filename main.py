@@ -120,14 +120,15 @@ def keras_upsampling(x):
     return x
 
 
-def keras_activate(x):
-    x = keras.layers.Activation("relu")(x)
+def keras_activate(x, method = "relu"):
+    x = keras.layers.Activation(method)(x)
     return x
 
 
 class Model(object):
     def __init__(self, img_shape, n_total_steps):
         self.img_shape = img_shape
+        self.latent_dim = 100
         self.initial_learning_rate = 1e-3
         self.end_learning_rate = 0.0
         self.n_total_steps = n_total_steps
@@ -136,7 +137,7 @@ class Model(object):
         self.init_graph()
 
 
-    def make_ae(self):
+    def make_ae_enc(self):
         n_features = 64
 
         x = keras.layers.Input(shape = self.img_shape)
@@ -145,14 +146,27 @@ class Model(object):
             features = keras_conv(features, 3, (i + 1)*n_features, stride = 2)
             features = keras_activate(features)
         features = keras_conv(features, 1, K.int_shape(features)[-1])
-        features = keras_activate(features)
+        mean = keras_conv(features, 1, self.latent_dim)
+        var = keras_conv(features, 1, self.latent_dim)
+        var = keras_activate(var, "softplus")
+
+        self.latent_shape = K.int_shape(mean)[1:]
+
+        return keras.models.Model(x, [mean, var])
+
+
+    def make_ae_dec(self):
+        n_features = 64
+
+        z = keras.layers.Input(shape = self.latent_shape)
+        features = z
         for i in reversed(range(4)):
             features = keras_upsampling(features)
             features = keras_conv(features, 3, (i + 1)*n_features)
             features = keras_activate(features)
         output = keras_conv(features, 3, 3)
 
-        return keras.models.Model(x, output)
+        return keras.models.Model(z, output)
 
 
     def define_graph(self):
@@ -161,11 +175,23 @@ class Model(object):
         self.img_ops = {}
 
         global_step = tf.Variable(0, trainable = False)
-        ae = self.make_ae()
+        ae_enc = self.make_ae_enc()
+        ae_dec = self.make_ae_dec()
 
         x = tf.placeholder(tf.float32, shape = (None,) + self.img_shape)
-        x_rec = ae(x)
-        loss = tf.reduce_mean(tf.abs(x - x_rec))
+        mean, var = ae_enc(x)
+        z_shape = tf.shape(mean)
+        eps = tf.random_normal(z_shape, mean = 0.0, stddev = 1.0)
+        z = mean + tf.sqrt(var) * eps
+        x_rec = ae_dec(z)
+
+        # prior on latent space - kl distance to standard normal
+        loss_latent = 0.5 * tf.reduce_mean(tf.contrib.layers.flatten(
+            tf.square(mean) + var - tf.log(var) - 1.0))
+        # likelihood - reconstruction loss
+        loss_reconstruction = tf.reduce_mean(tf.contrib.layers.flatten(
+            tf.abs(x - x_rec)))
+        loss = loss_latent + loss_reconstruction
 
         learning_rate = tf.train.polynomial_decay(
                 learning_rate = self.initial_learning_rate,
