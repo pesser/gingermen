@@ -178,12 +178,17 @@ class Model(object):
         ae_enc = self.make_ae_enc()
         ae_dec = self.make_ae_dec()
 
+        # reconstruction
         x = tf.placeholder(tf.float32, shape = (None,) + self.img_shape)
         mean, var = ae_enc(x)
         z_shape = tf.shape(mean)
         eps = tf.random_normal(z_shape, mean = 0.0, stddev = 1.0)
         z = mean + tf.sqrt(var) * eps
         x_rec = ae_dec(z)
+
+        # generation
+        noise = tf.random_normal(z_shape, mean = 0.0, stddev = 1.0)
+        g = ae_dec(noise)
 
         # prior on latent space - kl distance to standard normal
         loss_latent = 0.5 * tf.reduce_mean(tf.contrib.layers.flatten(
@@ -208,7 +213,7 @@ class Model(object):
                 "loss": loss,
                 "global_step": global_step,
                 "learning_rate": learning_rate}
-        self.img_ops = {"x": x, "g": x_rec}
+        self.img_ops = {"x": x, "x_rec": x_rec, "g": g}
 
 
     def init_graph(self):
