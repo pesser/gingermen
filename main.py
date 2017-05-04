@@ -1,6 +1,6 @@
 import tensorflow as tf
 config = tf.ConfigProto()
-config.gpu_options.allow_growth = True
+config.gpu_options.allow_growth = False
 session = tf.Session(config = config)
 import keras.backend as K
 K.set_session(session)
@@ -12,6 +12,9 @@ from multiprocessing.pool import ThreadPool
 from keras.preprocessing.image import ImageDataGenerator
 from PIL import Image
 from tqdm import tqdm, trange
+
+
+grayscale = True
 
 
 data_dir = os.path.join(os.getcwd(), "data")
@@ -63,15 +66,18 @@ class BufferedWrapper(object):
 
 
 def preprocessing_function(x):
-    return x / 127.5 - 1.0
+    x = x / 127.5 - 1.0
+    return x
 
 
 def get_batches(img_shape, batch_size):
     generator = ImageDataGenerator(preprocessing_function = preprocessing_function)
     hostname = socket.gethostname()
+    color_mode = "grayscale" if grayscale else "rgb"
     batches = generator.flow_from_directory(
             data_dir,
             target_size = img_shape[:2],
+            color_mode = color_mode,
             class_mode = None,
             classes = [hostname],
             batch_size = batch_size,
@@ -102,6 +108,7 @@ def plot_images(X, name):
     rows = cols = math.ceil(rc)
     canvas = tile(X, rows, cols)
     fname = os.path.join(out_dir, name + ".png")
+    canvas = np.squeeze(canvas)
     Image.fromarray(np.uint8(255*canvas)).save(fname)
 
 
@@ -139,13 +146,13 @@ class Model(object):
 
     def make_ae_enc(self):
         n_features = 64
+        self.n_downsamplings = n_downsamplings = 6
 
         x = keras.layers.Input(shape = self.img_shape)
         features = x
-        for i in range(4):
+        for i in range(n_downsamplings):
             features = keras_conv(features, 3, (i + 1)*n_features, stride = 2)
             features = keras_activate(features)
-        features = keras_conv(features, 1, K.int_shape(features)[-1])
         mean = keras_conv(features, 1, self.latent_dim)
         var = keras_conv(features, 1, self.latent_dim)
         var = keras_activate(var, "softplus")
@@ -157,14 +164,16 @@ class Model(object):
 
     def make_ae_dec(self):
         n_features = 64
+        n_upsamplings = self.n_downsamplings
+        n_out_channels = 1 if grayscale else 3
 
         z = keras.layers.Input(shape = self.latent_shape)
         features = z
-        for i in reversed(range(4)):
+        for i in reversed(range(n_upsamplings)):
             features = keras_upsampling(features)
             features = keras_conv(features, 3, (i + 1)*n_features)
             features = keras_activate(features)
-        output = keras_conv(features, 3, 3)
+        output = keras_conv(features, 3, n_out_channels)
 
         return keras.models.Model(z, output)
 
@@ -196,7 +205,10 @@ class Model(object):
         # likelihood - reconstruction loss
         loss_reconstruction = tf.reduce_mean(tf.contrib.layers.flatten(
             tf.abs(x - x_rec)))
-        loss = loss_latent + loss_reconstruction
+        # increasing weight for latent loss
+        loss_latent_weight = (
+                (1.0 - 0.0) / (self.n_total_steps - 0.0) * (tf.cast(global_step, tf.float32) - 0.0) + 0.0)
+        loss = loss_latent_weight * loss_latent + loss_reconstruction
 
         learning_rate = tf.train.polynomial_decay(
                 learning_rate = self.initial_learning_rate,
@@ -212,7 +224,9 @@ class Model(object):
         self.log_ops = {
                 "loss": loss,
                 "global_step": global_step,
-                "learning_rate": learning_rate}
+                "learning_rate": learning_rate,
+                "loss_latent_weight": loss_latent_weight,
+                "mean_var": tf.reduce_mean(var)}
         self.img_ops = {"x": x, "x_rec": x_rec, "g": g}
 
 
@@ -246,7 +260,11 @@ class Model(object):
 
 
 if __name__ == "__main__":
-    img_shape = (128, 128, 3)
+    if grayscale:
+        img_shape = (128, 128, 1)
+    else:
+        img_shape = (128, 128, 3)
+
     batch_size = 64
 
     init_logging()
