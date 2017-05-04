@@ -5,7 +5,7 @@ session = tf.Session(config = config)
 import keras.backend as K
 K.set_session(session)
 
-import os, logging, shutil, datetime, socket
+import os, logging, shutil, datetime, socket, time
 from multiprocessing.pool import ThreadPool
 from keras.preprocessing.image import ImageDataGenerator
 
@@ -24,7 +24,10 @@ def init_logging():
     out_dir = os.path.join(out_base_dir, now)
     os.makedirs(out_dir, exist_ok = False)
     # make link to current logging directory for convenience
-    os.symlink(out_dir, os.path.join(out_base_dir, "last"))
+    last_link = os.path.join(out_base_dir, "last")
+    if os.path.islink(last_link):
+        os.remove(last_link)
+    os.symlink(out_dir, last_link)
     # copy source code to logging dir to have an idea what the run was about
     this_file = os.path.realpath(__file__)
     assert(this_file.endswith(".py"))
