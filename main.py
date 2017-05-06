@@ -15,6 +15,7 @@ from tqdm import tqdm, trange
 
 
 grayscale = True
+cnconv = True
 
 
 data_dir = os.path.join(os.getcwd(), "data")
@@ -112,6 +113,75 @@ def plot_images(X, name):
     Image.fromarray(np.uint8(255*canvas)).save(fname)
 
 
+def keras_cnconv(x, kernel_size, filters, stride = 1, scale = 1.0):
+    init_standard_normal = keras.initializers.RandomNormal(
+            mean = 0.0,
+            stddev = 1.0)
+    convolution_layer = keras.layers.Conv2D(
+            filters = filters,
+            kernel_size = kernel_size,
+            strides = stride,
+            padding = "SAME",
+            kernel_initializer = init_standard_normal)
+    square_layer = keras.layers.Lambda(lambda x: K.square(x))
+    patch_l2_layer = keras.layers.Conv2D(
+            filters = filters,
+            kernel_size = kernel_size,
+            strides = stride,
+            padding = "SAME",
+            kernel_initializer = "ones")
+    patch_l2_layer.trainable = False
+    sqrtscale = math.sqrt(scale)
+    normalize_layer = keras.layers.Lambda(lambda xy: sqrtscale * xy[0] / (K.sqrt(xy[1]) + eps))
+
+    convolution = convolution_layer(x)
+    xsquare = square_layer(x)
+    patch_l2 = patch_l2_layer(xsquare)
+    eps = 1e-8
+    result = normalize_layer([convolution, patch_l2])
+
+    return result
+
+
+def keras_cndense(x, units):
+    init_standard_normal = keras.initializers.RandomNormal(
+            mean = 0.0,
+            stddev = 1.0)
+    dense_layer = keras.layers.Dense(units = units, kernel_initializer = init_standard_normal)
+    square_layer = keras.layers.Lambda(lambda x: K.square(x))
+    patch_l2_layer = keras.layers.Dense(units = units, kernel_initializer = "ones")
+    patch_l2_layer.trainable = False
+    normalize_layer = keras.layers.Lambda(lambda xy: xy[0] / (K.sqrt(xy[1]) + eps))
+
+    dense = dense_layer(x)
+    xsquare = square_layer(x)
+    patch_l2 = patch_l2_layer(xsquare)
+    eps = 1e-8
+    result = normalize_layer([dense, patch_l2])
+
+    return result
+
+
+def keras_dense(x, units):
+    return keras.layers.Dense(units = units, kernel_initializer = "he_normal")(x)
+
+
+def keras_scaled_conv(x, kernel_size, filters, stride = 1):
+    in_shape = K.int_shape(x)
+    fan_in = kernel_size*kernel_size*in_shape[-1]
+    stddev = 0.1 * 1.0 / math.sqrt(fan_in)
+    init_normal = keras.initializers.RandomNormal(
+            mean = 0.0,
+            stddev = stddev)
+    x = keras.layers.Conv2D(
+            filters = filters,
+            kernel_size = kernel_size,
+            strides = stride,
+            padding = "SAME",
+            kernel_initializer = init_normal)(x)
+    return x
+
+
 def keras_conv(x, kernel_size, filters, stride = 1):
     x = keras.layers.Conv2D(
             filters = filters,
@@ -127,55 +197,107 @@ def keras_upsampling(x):
     return x
 
 
-def keras_activate(x, method = "relu"):
+def keras_activate(x, method = "elu"):
     x = keras.layers.Activation(method)(x)
     return x
+
+
+def keras_flatten(x):
+    return keras.layers.Flatten()(x)
+
+
+def keras_reshape(x, target_shape):
+    return keras.layers.Reshape(target_shape)(x)
+
+
+def keras_concatenate(xs):
+    return keras.layers.Concatenate(axis = -1)(xs)
 
 
 class Model(object):
     def __init__(self, img_shape, n_total_steps):
         self.img_shape = img_shape
-        self.latent_dim = 100
+        self.latent_dim = 1024
         self.initial_learning_rate = 1e-3
         self.end_learning_rate = 0.0
         self.n_total_steps = n_total_steps
-        self.log_frequency = 250
+        self.log_frequency = 50
         self.define_graph()
         self.init_graph()
 
 
     def make_ae_enc(self):
         n_features = 64
-        self.n_downsamplings = n_downsamplings = 6
+        kernel_size = 3
+        self.n_downsamplings = n_downsamplings = 5
+        stride = 2
+
+        flatten_op = keras_flatten
+        if cnconv:
+            conv_op = keras_cnconv
+            activation_op = lambda x: x
+            dense_op = keras_cndense
+        else:
+            conv_op = keras_conv
+            activation_op = keras_activate
+            dense_op = keras_dense
+
+        means = []
+        vars_ = []
+        self.z_shapes = []
 
         x = keras.layers.Input(shape = self.img_shape)
         features = x
         for i in range(n_downsamplings):
-            features = keras_conv(features, 3, (i + 1)*n_features, stride = 2)
-            features = keras_activate(features)
-        mean = keras_conv(features, 1, self.latent_dim)
-        var = keras_conv(features, 1, self.latent_dim)
-        var = keras_activate(var, "softplus")
+            features = conv_op(features, kernel_size, 2**i*n_features, stride = stride)
+            features = activation_op(features)
+            mean = conv_op(features, 1, 2**(i+1)*n_features)
+            var = conv_op(features, 1, 2**(i+1)*n_features)
+            var = keras_activate(var, "softplus")
+            means.append(mean)
+            vars_.append(var)
+            self.z_shapes.append(K.int_shape(mean)[1:])
 
-        self.latent_shape = K.int_shape(mean)[1:]
-
-        return keras.models.Model(x, [mean, var])
+        return keras.models.Model(x, means + vars_)
 
 
     def make_ae_dec(self):
         n_features = 64
+        kernel_size = 3
         n_upsamplings = self.n_downsamplings
         n_out_channels = 1 if grayscale else 3
 
-        z = keras.layers.Input(shape = self.latent_shape)
-        features = z
-        for i in reversed(range(n_upsamplings)):
-            features = keras_upsampling(features)
-            features = keras_conv(features, 3, (i + 1)*n_features)
-            features = keras_activate(features)
-        output = keras_conv(features, 3, n_out_channels)
+        upsampling_op = keras_upsampling
+        reshape_op = keras_reshape
+        concat_op = keras_concatenate
+        if cnconv:
+            conv_op = keras_cnconv
+            activation_op = lambda x: x
+            dense_op = keras_cndense
+        else:
+            conv_op = keras_conv
+            activation_op = keras_activate
+            dense_op = keras_dense
 
-        return keras.models.Model(z, output)
+        inputs = []
+        for z_shape in self.z_shapes:
+            inputs.append(keras.layers.Input(shape = z_shape))
+
+        for i in reversed(range(n_upsamplings)):
+            if i == n_upsamplings - 1:
+                features = inputs[i]
+            else:
+                features = concat_op([features, inputs[i]])
+
+            features = upsampling_op(features)
+            features = conv_op(features, kernel_size, 2**i*n_features)
+            features = activation_op(features)
+        if cnconv:
+            output = conv_op(features, kernel_size, n_out_channels, scale = 1/3)
+        else:
+            output = conv_op(features, kernel_size, n_out_channels)
+
+        return keras.models.Model(inputs, output)
 
 
     def define_graph(self):
@@ -187,17 +309,27 @@ class Model(object):
         ae_enc = self.make_ae_enc()
         ae_dec = self.make_ae_dec()
 
+        def split_output(l):
+            return l[:len(l)//2], l[len(l)//2:]
+
         # reconstruction
         x = tf.placeholder(tf.float32, shape = (None,) + self.img_shape)
-        mean, var = ae_enc(x)
-        z_shape = tf.shape(mean)
-        eps = tf.random_normal(z_shape, mean = 0.0, stddev = 1.0)
-        z = mean + tf.sqrt(var) * eps
-        x_rec = ae_dec(z)
+        outputs = ae_enc(x)
+        means, vars_ = split_output(outputs)
+        zs = []
+        noises = []
+        for mean, var in zip(means, vars_):
+            # sample from encoder distribution
+            z_shape = tf.shape(mean)
+            eps = tf.random_normal(z_shape, mean = 0.0, stddev = 1.0)
+            z = mean + tf.sqrt(var) * eps
+            zs.append(z)
+            # noise
+            noises.append(tf.random_normal(z_shape, mean = 0.0, stddev = 1.0))
 
+        x_rec = ae_dec(zs)
         # generation
-        noise = tf.random_normal(z_shape, mean = 0.0, stddev = 1.0)
-        g = ae_dec(noise)
+        g = ae_dec(noises)
 
         # prior on latent space - kl distance to standard normal
         loss_latent = 0.5 * tf.reduce_mean(tf.contrib.layers.flatten(
@@ -208,8 +340,11 @@ class Model(object):
         # increasing weight for latent loss
         loss_latent_weight = (
                 (1.0 - 0.0) / (self.n_total_steps - 0.0) * (tf.cast(global_step, tf.float32) - 0.0) + 0.0)
-        loss = loss_latent_weight * loss_latent + loss_reconstruction
+        #loss = loss_latent_weight * loss_latent + loss_reconstruction
+        loss = loss_reconstruction
 
+        trainable_vars = ae_enc.trainable_weights + ae_dec.trainable_weights
+        logging.debug("Trainable vars: {}".format(len(trainable_vars)))
         learning_rate = tf.train.polynomial_decay(
                 learning_rate = self.initial_learning_rate,
                 global_step = global_step,
@@ -217,7 +352,7 @@ class Model(object):
                 end_learning_rate = self.end_learning_rate,
                 power = 1.0)
         optimizer = tf.train.AdamOptimizer(learning_rate = learning_rate)
-        train = optimizer.minimize(loss, global_step = global_step)
+        train = optimizer.minimize(loss, global_step = global_step, var_list = trainable_vars)
 
         self.inputs = {"x": x}
         self.train_ops = {"train": train}
@@ -261,9 +396,9 @@ class Model(object):
 
 if __name__ == "__main__":
     if grayscale:
-        img_shape = (128, 128, 1)
+        img_shape = (64, 64, 1)
     else:
-        img_shape = (128, 128, 3)
+        img_shape = (64, 64, 3)
 
     batch_size = 64
 
