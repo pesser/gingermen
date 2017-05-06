@@ -198,6 +198,12 @@ def keras_upsampling(x):
     return x
 
 
+def keras_subpixel_upsampling(x):
+    def lambda_subpixel(X):
+        return tf.depth_to_space(X, 2)
+    return keras.layers.Lambda(lambda_subpixel)(x)
+
+
 def keras_activate(x, method = "relu"):
     x = keras.layers.Activation(method)(x)
     return x
@@ -292,8 +298,8 @@ class Model(object):
             elif i > 1: # only use features of higher layers
                 features = concat_op([features, inputs[i]])
 
-            features = upsampling_op(features)
-            features = conv_op(features, kernel_size, 2**i*n_features)
+            features = conv_op(features, kernel_size, 2**i*n_features*2*2)
+            features = keras_subpixel_upsampling(features)
             features = activation_op(features)
         if cnconv:
             output = conv_op(features, kernel_size, n_out_channels, scale = 1/3)
