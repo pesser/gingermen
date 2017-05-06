@@ -128,6 +128,7 @@ def keras_cnconv(x, kernel_size, filters, stride = 1, scale = 1.0):
             filters = filters,
             kernel_size = kernel_size,
             strides = stride,
+            use_bias = False,
             padding = "SAME",
             kernel_initializer = "ones")
     patch_l2_layer.trainable = False
@@ -237,7 +238,7 @@ class Model(object):
         flatten_op = keras_flatten
         if cnconv:
             conv_op = keras_cnconv
-            activation_op = lambda x: x
+            activation_op = lambda x: keras_activate(x, "elu")
             dense_op = keras_cndense
         else:
             conv_op = keras_conv
@@ -274,7 +275,7 @@ class Model(object):
         concat_op = keras_concatenate
         if cnconv:
             conv_op = keras_cnconv
-            activation_op = lambda x: x
+            activation_op = lambda x: keras_activate(x, "elu")
             dense_op = keras_cndense
         else:
             conv_op = keras_conv
@@ -334,16 +335,17 @@ class Model(object):
         g = ae_dec(noises)
 
         # prior on latent space - kl distance to standard normal
-        loss_latent = 0.5 * tf.reduce_mean(tf.contrib.layers.flatten(
-            tf.square(mean) + var - tf.log(var) - 1.0))
+        loss_latent = 0.0
+        for mean, var in zip(means, vars_):
+            loss_latent += 0.5 * tf.reduce_mean(tf.contrib.layers.flatten(
+                tf.square(mean) + var - tf.log(var) - 1.0)) / float(len(means))
         # likelihood - reconstruction loss
         loss_reconstruction = tf.reduce_mean(tf.contrib.layers.flatten(
             tf.abs(x - x_rec)))
         # increasing weight for latent loss
         loss_latent_weight = (
                 (1.0 - 0.0) / (self.n_total_steps - 0.0) * (tf.cast(global_step, tf.float32) - 0.0) + 0.0)
-        #loss = loss_latent_weight * loss_latent + loss_reconstruction
-        loss = loss_reconstruction
+        loss = loss_latent_weight * loss_latent + loss_reconstruction
 
         trainable_vars = ae_enc.trainable_weights + ae_dec.trainable_weights
         logging.debug("Trainable vars: {}".format(len(trainable_vars)))
