@@ -197,7 +197,7 @@ def keras_upsampling(x):
     return x
 
 
-def keras_activate(x, method = "elu"):
+def keras_activate(x, method = "relu"):
     x = keras.layers.Activation(method)(x)
     return x
 
@@ -219,6 +219,8 @@ class Model(object):
         self.img_shape = img_shape
         self.latent_dim = 1024
         self.initial_learning_rate = 1e-3
+        if cnconv:
+            self.initial_learning_rate = 1e-2
         self.end_learning_rate = 0.0
         self.n_total_steps = n_total_steps
         self.log_frequency = 50
@@ -286,7 +288,7 @@ class Model(object):
         for i in reversed(range(n_upsamplings)):
             if i == n_upsamplings - 1:
                 features = inputs[i]
-            else:
+            elif i > 1: # only use features of higher layers
                 features = concat_op([features, inputs[i]])
 
             features = upsampling_op(features)
