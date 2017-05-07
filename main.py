@@ -6,15 +6,15 @@ import keras.backend as K
 K.set_session(session)
 import keras
 
-import os, logging, shutil, datetime, socket, time, math
+import os, logging, shutil, datetime, socket, time, math, functools
 import numpy as np
 from multiprocessing.pool import ThreadPool
-from keras.preprocessing.image import ImageDataGenerator
+from keras.preprocessing.image import ImageDataGenerator, load_img, img_to_array
 from PIL import Image
 from tqdm import tqdm, trange
 
 
-grayscale = True
+grayscale = False
 cnconv = True
 
 
@@ -85,6 +85,64 @@ def get_batches(img_shape, batch_size):
             shuffle = True)
 
     return BufferedWrapper(batches)
+
+
+class FileFlow(object):
+    def __init__(self, batch_size, img_shape, paths, preprocessing_function):
+        fnames = list(set(fname for fname in os.listdir(path) if fname.endswith(".jpg")) for path in paths)
+        fnames = list(functools.reduce(lambda a, b: a & b, fnames))
+        self.batch_size = batch_size
+        self.img_shape = img_shape
+        self.paths = paths
+        self.preprocessing_function = preprocessing_function
+        self.fnames = fnames
+        self.n = len(fnames)
+        logging.info("Found {} images.".format(self.n))
+        self.shuffle()
+
+
+    def __next__(self):
+        batch_start, batch_end = self.batch_start, self.batch_start + self.batch_size
+        # do
+        batch_indices = self.indices[batch_start:batch_end]
+        batch_fnames = [self.fnames[i] for i in batch_indices]
+
+        current_batch_size = len(batch_fnames)
+        grayscale = self.img_shape[2] == 1
+        batches = []
+        for path in self.paths:
+            path_batch = np.zeros((current_batch_size,) + self.img_shape, dtype = K.floatx())
+            for i, fname in enumerate(batch_fnames):
+                img = load_img(os.path.join(path, fname),
+                               grayscale = grayscale,
+                               target_size = self.img_shape[:2])
+                x = img_to_array(img)
+                x = self.preprocessing_function(x)
+                path_batch[i] = x
+            batches.append(path_batch)
+
+        if batch_end > self.n:
+            self.shuffle()
+        else:
+            self.batch_start = batch_end
+
+        return batches
+
+
+    def shuffle(self):
+        self.batch_start = 0
+        self.indices = np.random.permutation(self.n)
+
+
+def get_paired_batches(img_shape, batch_size):
+    xdomain_dir = os.path.join(data_dir, "x")
+    ydomain_dir = os.path.join(data_dir, "y")
+
+    flow = FileFlow(batch_size, img_shape, [xdomain_dir, ydomain_dir], preprocessing_function)
+    #flow = FileFlow(batch_size, img_shape, [ydomain_dir, ydomain_dir], preprocessing_function)
+    #flow = FileFlow(batch_size, img_shape, [xdomain_dir, xdomain_dir], preprocessing_function)
+    #flow = FileFlow(batch_size, img_shape, [ydomain_dir, xdomain_dir], preprocessing_function)
+    return BufferedWrapper(flow)
 
 
 def tile(X, rows, cols):
@@ -298,13 +356,14 @@ class Model(object):
             elif i > 1: # only use features of higher layers
                 features = concat_op([features, inputs[i]])
 
-            features = conv_op(features, kernel_size, 2**i*n_features*2*2)
-            features = keras_subpixel_upsampling(features)
-            features = activation_op(features)
-        if cnconv:
-            output = conv_op(features, kernel_size, n_out_channels, scale = 1/3)
-        else:
-            output = conv_op(features, kernel_size, n_out_channels)
+            if i > 0:
+                features = conv_op(features, kernel_size, 2**i*n_features*2*2)
+                features = keras_subpixel_upsampling(features)
+                features = activation_op(features)
+            else:
+                features = conv_op(features, kernel_size, n_out_channels*2*2)
+                features = keras_subpixel_upsampling(features)
+        output = features
 
         return keras.models.Model(inputs, output)
 
@@ -323,6 +382,7 @@ class Model(object):
 
         # reconstruction
         x = tf.placeholder(tf.float32, shape = (None,) + self.img_shape)
+        y = tf.placeholder(tf.float32, shape = (None,) + self.img_shape)
         outputs = ae_enc(x)
         means, vars_ = split_output(outputs)
         zs = []
@@ -347,11 +407,13 @@ class Model(object):
                 tf.square(mean) + var - tf.log(var) - 1.0)) / float(len(means))
         # likelihood - reconstruction loss
         loss_reconstruction = tf.reduce_mean(tf.contrib.layers.flatten(
-            tf.abs(x - x_rec)))
+            tf.square(y - x_rec)))
         # increasing weight for latent loss
         loss_latent_weight = (
                 (1.0 - 0.0) / (self.n_total_steps - 0.0) * (tf.cast(global_step, tf.float32) - 0.0) + 0.0)
-        loss = loss_latent_weight * loss_latent + loss_reconstruction
+        #loss = loss_latent_weight * loss_latent + loss_reconstruction
+        #loss = loss_latent + loss_reconstruction
+        loss = loss_reconstruction
 
         trainable_vars = ae_enc.trainable_weights + ae_dec.trainable_weights
         logging.debug("Trainable vars: {}".format(len(trainable_vars)))
@@ -364,7 +426,7 @@ class Model(object):
         optimizer = tf.train.AdamOptimizer(learning_rate = learning_rate)
         train = optimizer.minimize(loss, global_step = global_step, var_list = trainable_vars)
 
-        self.inputs = {"x": x}
+        self.inputs = {"x": x, "y": y}
         self.train_ops = {"train": train}
         self.log_ops = {
                 "loss": loss,
@@ -372,7 +434,7 @@ class Model(object):
                 "learning_rate": learning_rate,
                 "loss_latent_weight": loss_latent_weight,
                 "mean_var": tf.reduce_mean(var)}
-        self.img_ops = {"x": x, "x_rec": x_rec, "g": g}
+        self.img_ops = {"x": x, "y": y, "x_rec": x_rec, "g": g}
 
 
     def init_graph(self):
@@ -381,9 +443,10 @@ class Model(object):
 
     def fit(self, batches):
         for batch in trange(self.n_total_steps):
-            X_batch = next(batches)
+            X_batch, Y_batch = next(batches)
             feed_dict = {
-                    self.inputs["x"]: X_batch}
+                    self.inputs["x"]: X_batch,
+                    self.inputs["y"]: Y_batch}
             fetch_dict = {"train": self.train_ops}
             if self.log_ops["global_step"].eval(session) % self.log_frequency == 0:
                 fetch_dict["log"] = self.log_ops
@@ -413,7 +476,7 @@ if __name__ == "__main__":
     batch_size = 64
 
     init_logging()
-    batches = get_batches(img_shape, batch_size)
+    batches = get_paired_batches(img_shape, batch_size)
     logging.info("Number of samples: {}".format(batches.n))
 
     n_epochs = 100
