@@ -134,9 +134,9 @@ class FileFlow(object):
         self.indices = np.random.permutation(self.n)
 
 
-def get_paired_batches(img_shape, batch_size):
-    xdomain_dir = os.path.join(data_dir, "x")
-    ydomain_dir = os.path.join(data_dir, "y")
+def get_paired_batches(split, img_shape, batch_size):
+    xdomain_dir = os.path.join(data_dir, split, "x")
+    ydomain_dir = os.path.join(data_dir, split, "y")
 
     flow = FileFlow(batch_size, img_shape, [xdomain_dir, ydomain_dir], preprocessing_function)
     #flow = FileFlow(batch_size, img_shape, [ydomain_dir, ydomain_dir], preprocessing_function)
@@ -441,7 +441,8 @@ class Model(object):
         session.run(tf.global_variables_initializer())
 
 
-    def fit(self, batches):
+    def fit(self, batches, valid_batches = None):
+        self.valid_batches = valid_batches
         for batch in trange(self.n_total_steps):
             X_batch, Y_batch = next(batches)
             feed_dict = {
@@ -465,6 +466,31 @@ class Model(object):
             global_step = self.log_ops["global_step"].eval(session)
             for k, v in result["img"].items():
                 plot_images(v, k + "_{:07}".format(global_step))
+            self.validate()
+
+
+    def validate(self):
+        if self.valid_batches is not None:
+            global_step = self.log_ops["global_step"].eval(session)
+            seen_batches = 0
+            losses = []
+            while seen_batches < self.valid_batches.n:
+                X_batch, Y_batch = next(self.valid_batches)
+                seen_batches += X_batch.shape[0]
+                feed_dict = {
+                        self.inputs["x"]: X_batch,
+                        self.inputs["y"]: Y_batch}
+                fetch_dict = {
+                        "log": self.log_ops,
+                        "img": self.img_ops}
+                result = session.run(fetch_dict, feed_dict)
+                losses.append(result["log"]["loss"])
+            # plot last batch of images
+            for k, v in result["img"].items():
+                plot_images(v, "valid_" + k + "_{:07}".format(global_step))
+            # log average loss
+            loss = np.mean(losses)
+            logging.info("{}: {:.4e}".format("validation loss", loss))
 
 
 if __name__ == "__main__":
@@ -476,10 +502,12 @@ if __name__ == "__main__":
     batch_size = 64
 
     init_logging()
-    batches = get_paired_batches(img_shape, batch_size)
-    logging.info("Number of samples: {}".format(batches.n))
+    batches = get_paired_batches("train", img_shape, batch_size)
+    logging.info("Number of training samples: {}".format(batches.n))
+    valid_batches = get_paired_batches("valid", img_shape, batch_size)
+    logging.info("Number of validation samples: {}".format(batches.n))
 
     n_epochs = 100
     n_total_steps = int(n_epochs * batches.n / batch_size)
     model = Model(img_shape, n_total_steps)
-    model.fit(batches)
+    model.fit(batches, valid_batches)
