@@ -171,34 +171,63 @@ def plot_images(X, name):
     Image.fromarray(np.uint8(255*canvas)).save(fname)
 
 
+class CNConv2D(keras.engine.topology.Layer):
+    def __init__(self, kernel_size, filters, stride, **kwargs):
+        self.kernel_size = kernel_size
+        self.output_features = filters
+        self.stride = stride
+        self.strides = (1, self.stride, self.stride, 1)
+        self.padding = "SAME"
+        self.initializer = init_standard_normal = keras.initializers.RandomNormal(mean = 0.0, stddev = 1.0)
+        super(CNConv2D, self).__init__(**kwargs)
+
+
+    def build(self, input_shape):
+        assert(len(input_shape) == 4)
+        input_features = input_shape[3]
+        self.kernel_shape = (self.kernel_size, self.kernel_size, input_features, self.output_features)
+        self.kernel = self.add_weight(
+                shape = self.kernel_shape,
+                initializer = self.initializer,
+                trainable = True)
+        self.bias = self.add_weight(
+                shape = (self.output_features,),
+                initializer = "zeros",
+                trainable = True)
+        super(CNConv2D, self).build(input_shape)
+
+
+    def call(self, x):
+        normalization = tf.sqrt(tf.nn.conv2d(
+                tf.square(x),
+                tf.ones(self.kernel_shape),
+                strides = self.strides,
+                padding = self.padding)) + 1e-6
+        x = tf.nn.conv2d(
+                x,
+                self.kernel,
+                strides = self.strides,
+                padding = self.padding)
+        x = x / normalization
+        x = tf.nn.bias_add(x, self.bias)
+        return x
+
+
+    def compute_output_shape(self, input_shape):
+        space = input_shape[1:-1]
+        new_space = []
+        for i in range(len(space)):
+            new_dim = keras.utils.conv_utils.conv_output_length(
+                space[i],
+                self.kernel_size,
+                padding = self.padding.lower(),
+                stride = self.stride)
+            new_space.append(new_dim)
+        return (input_shape[0],) + tuple(new_space) + (self.output_features,)
+
+
 def keras_cnconv(x, kernel_size, filters, stride = 1, scale = 1.0):
-    init_standard_normal = keras.initializers.RandomNormal(
-            mean = 0.0,
-            stddev = 1.0)
-    convolution_layer = keras.layers.Conv2D(
-            filters = filters,
-            kernel_size = kernel_size,
-            strides = stride,
-            padding = "SAME",
-            kernel_initializer = init_standard_normal)
-    square_layer = keras.layers.Lambda(lambda x: K.square(x))
-    patch_l2_layer = keras.layers.Conv2D(
-            filters = filters,
-            kernel_size = kernel_size,
-            strides = stride,
-            use_bias = False,
-            padding = "SAME",
-            kernel_initializer = "ones")
-    patch_l2_layer.trainable = False
-    sqrtscale = math.sqrt(scale)
-    normalize_layer = keras.layers.Lambda(lambda xy: sqrtscale * xy[0] / (K.sqrt(xy[1]) + eps))
-
-    convolution = convolution_layer(x)
-    xsquare = square_layer(x)
-    patch_l2 = patch_l2_layer(xsquare)
-    eps = 1e-8
-    result = normalize_layer([convolution, patch_l2])
-
+    result = CNConv2D(kernel_size, filters, stride)(x)
     return result
 
 
@@ -352,8 +381,10 @@ class Model(object):
 
         for i in reversed(range(n_upsamplings)):
             if i == n_upsamplings - 1:
+                logging.info("Decoder input shape: {}".format(K.int_shape(inputs[i])))
                 features = inputs[i]
-            elif i > 1: # only use features of higher layers
+            elif i > 0: # only use features of higher layers
+                logging.info("Decoder input shape: {}".format(K.int_shape(inputs[i])))
                 features = concat_op([features, inputs[i]])
 
             if i > 0:
