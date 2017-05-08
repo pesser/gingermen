@@ -537,7 +537,7 @@ if __name__ == "__main__":
     batches = get_paired_batches("train", img_shape, batch_size)
     logging.info("Number of training samples: {}".format(batches.n))
     valid_batches = get_paired_batches("valid", img_shape, batch_size)
-    logging.info("Number of validation samples: {}".format(batches.n))
+    logging.info("Number of validation samples: {}".format(valid_batches.n))
 
     n_epochs = 100
     n_total_steps = int(n_epochs * batches.n / batch_size)
