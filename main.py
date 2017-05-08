@@ -282,12 +282,12 @@ def keras_concatenate(xs):
 class Model(object):
     def __init__(self, img_shape, n_total_steps):
         self.img_shape = img_shape
-        self.latent_dim = 1024
         self.initial_learning_rate = 1e-3
         if cnconv:
             self.initial_learning_rate = 1e-2
         self.end_learning_rate = 0.0
         self.n_total_steps = n_total_steps
+        self.begin_latent_loss = int(0.05 * n_total_steps)
         self.log_frequency = 50
         self.define_graph()
         self.init_graph()
@@ -409,11 +409,12 @@ class Model(object):
         loss_reconstruction = tf.reduce_mean(tf.contrib.layers.flatten(
             tf.square(y - x_rec)))
         # increasing weight for latent loss
-        loss_latent_weight = (
-                (1.0 - 0.0) / (self.n_total_steps - 0.0) * (tf.cast(global_step, tf.float32) - 0.0) + 0.0)
-        #loss = loss_latent_weight * loss_latent + loss_reconstruction
-        #loss = loss_latent + loss_reconstruction
-        loss = loss_reconstruction
+        # (beta - alpha)/(b - a) * (x - a) + alpha
+        loss_latent_weight = tf.maximum(0.0,
+                (1.0 - 0.0) / (self.n_total_steps - self.begin_latent_loss) * (tf.cast(global_step, tf.float32) - self.begin_latent_loss) + 0.0)
+        loss = loss_latent_weight * loss_latent + loss_reconstruction
+        #loss = 0.01*loss_latent + loss_reconstruction
+        #loss = loss_reconstruction
 
         trainable_vars = ae_enc.trainable_weights + ae_dec.trainable_weights
         logging.debug("Trainable vars: {}".format(len(trainable_vars)))
