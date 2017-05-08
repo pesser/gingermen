@@ -6,7 +6,7 @@ import keras.backend as K
 K.set_session(session)
 import keras
 
-import os, logging, shutil, datetime, socket, time, math, functools
+import os, logging, shutil, datetime, socket, time, math, functools, itertools
 import numpy as np
 from multiprocessing.pool import ThreadPool
 from keras.preprocessing.image import ImageDataGenerator, load_img, img_to_array
@@ -135,8 +135,9 @@ class FileFlow(object):
 
 
 def get_paired_batches(split, img_shape, batch_size):
-    xdomain_dir = os.path.join(data_dir, split, "x")
-    ydomain_dir = os.path.join(data_dir, split, "y")
+    hostname = socket.gethostname()
+    xdomain_dir = os.path.join(data_dir, hostname, split, "x")
+    ydomain_dir = os.path.join(data_dir, hostname, split, "y")
 
     flow = FileFlow(batch_size, img_shape, [xdomain_dir, ydomain_dir], preprocessing_function)
     #flow = FileFlow(batch_size, img_shape, [ydomain_dir, ydomain_dir], preprocessing_function)
@@ -187,10 +188,12 @@ class CNConv2D(keras.engine.topology.Layer):
         input_features = input_shape[3]
         self.kernel_shape = (self.kernel_size, self.kernel_size, input_features, self.output_features)
         self.kernel = self.add_weight(
+                name = "kernel",
                 shape = self.kernel_shape,
                 initializer = self.initializer,
                 trainable = True)
         self.bias = self.add_weight(
+                name = "bias",
                 shape = (self.output_features,),
                 initializer = "zeros",
                 trainable = True)
@@ -316,36 +319,47 @@ class Model(object):
             self.initial_learning_rate = 1e-2
         self.end_learning_rate = 0.0
         self.n_total_steps = n_total_steps
-        self.begin_latent_loss = int(0.05 * n_total_steps)
-        self.log_frequency = 50
+        self.begin_latent_loss = 0 #int(0.05 * n_total_steps)
+        self.start_ladder = 1
+        self.log_frequency = 100
         self.define_graph()
         self.init_graph()
 
 
-    def make_ae_enc(self):
-        n_features = 64
+    def make_enc(self):
+        n_features = 32
         kernel_size = 3
-        self.n_downsamplings = n_downsamplings = 5
-        stride = 2
 
-        flatten_op = keras_flatten
-        if cnconv:
-            conv_op = keras_cnconv
-            activation_op = lambda x: keras_activate(x, "elu")
-            dense_op = keras_cndense
-        else:
-            conv_op = keras_conv
-            activation_op = keras_activate
-            dense_op = keras_dense
+        conv_op = keras_cnconv
+        activation_op = lambda x: keras_activate(x, "elu")
+
+        input_ = keras.layers.Input(shape = self.img_shape)
+        features = input_
+        features = conv_op(features, kernel_size, 2**0*n_features, stride = 2)
+        features = conv_op(features, kernel_size, 2**1*n_features)
+        output = features
+        self.enc_output_shape = K.int_shape(output)[1:]
+
+        return keras.models.Model(input_, output)
+
+
+    def make_ladder_enc(self):
+        n_features = self.enc_output_shape[-1]
+        kernel_size = 3
+        self.n_downsamplings = n_downsamplings = 4
+
+        conv_op = keras_cnconv
+        activation_op = lambda x: keras_activate(x, "elu")
+        dense_op = keras_cndense
 
         means = []
         vars_ = []
         self.z_shapes = []
 
-        x = keras.layers.Input(shape = self.img_shape)
-        features = x
+        input_ = keras.layers.Input(shape = self.enc_output_shape)
+        features = input_
         for i in range(n_downsamplings):
-            features = conv_op(features, kernel_size, 2**i*n_features, stride = stride)
+            features = conv_op(features, kernel_size, 2**i*n_features, stride = 2)
             features = activation_op(features)
             mean = conv_op(features, 1, 2**(i+1)*n_features)
             var = conv_op(features, 1, 2**(i+1)*n_features)
@@ -354,49 +368,57 @@ class Model(object):
             vars_.append(var)
             self.z_shapes.append(K.int_shape(mean)[1:])
 
-        return keras.models.Model(x, means + vars_)
+        return keras.models.Model(input_, means + vars_)
 
 
-    def make_ae_dec(self):
-        n_features = 64
+    def make_ladder_dec(self):
+        n_features = self.enc_output_shape[-1]
         kernel_size = 3
         n_upsamplings = self.n_downsamplings
-        n_out_channels = 1 if grayscale else 3
 
-        upsampling_op = keras_upsampling
-        reshape_op = keras_reshape
         concat_op = keras_concatenate
-        if cnconv:
-            conv_op = keras_cnconv
-            activation_op = lambda x: keras_activate(x, "elu")
-            dense_op = keras_cndense
-        else:
-            conv_op = keras_conv
-            activation_op = keras_activate
-            dense_op = keras_dense
+        conv_op = keras_cnconv
+        activation_op = lambda x: keras_activate(x, "elu")
+        dense_op = keras_cndense
 
         inputs = []
         for z_shape in self.z_shapes:
             inputs.append(keras.layers.Input(shape = z_shape))
 
         for i in reversed(range(n_upsamplings)):
-            if i == n_upsamplings - 1:
-                logging.info("Decoder input shape: {}".format(K.int_shape(inputs[i])))
-                features = inputs[i]
-            elif i > 0: # only use features of higher layers
-                logging.info("Decoder input shape: {}".format(K.int_shape(inputs[i])))
-                features = concat_op([features, inputs[i]])
+            dec_layer = n_upsamplings - 1 - i
+            if dec_layer == 0:
+                logging.info("Ladder decoder input shape: {}".format(K.int_shape(inputs[-(1 + dec_layer)])))
+                features = inputs[-(1 + dec_layer)]
+            else: # concatenate ladder connections
+                logging.info("Ladder decoder input shape: {}".format(K.int_shape(inputs[-(1 + dec_layer)])))
+                features = concat_op([features, inputs[-(1 + dec_layer)]])
 
-            if i > 0:
-                features = conv_op(features, kernel_size, 2**i*n_features*2*2)
-                features = keras_subpixel_upsampling(features)
-                features = activation_op(features)
-            else:
-                features = conv_op(features, kernel_size, n_out_channels*2*2)
-                features = keras_subpixel_upsampling(features)
+            features = conv_op(features, kernel_size, 2**i*n_features*2*2)
+            features = keras_subpixel_upsampling(features)
+            features = activation_op(features)
         output = features
+        self.ladder_dec_output_shape = K.int_shape(output)[1:]
 
         return keras.models.Model(inputs, output)
+
+
+    def make_dec(self):
+        n_out_channels = self.img_shape[-1]
+        n_features = self.enc_output_shape[-1]
+        kernel_size = 3
+
+        conv_op = keras_cnconv
+        activation_op = lambda x: keras_activate(x, "elu")
+
+        input_ = keras.layers.Input(shape = self.ladder_dec_output_shape)
+        features = input_
+        features = conv_op(features, kernel_size, 2**1*n_features)
+        features = conv_op(features, kernel_size, n_out_channels*2*2)
+        features = keras_subpixel_upsampling(features)
+        output = features
+
+        return keras.models.Model(input_, output)
 
 
     def define_graph(self):
@@ -404,50 +426,68 @@ class Model(object):
         self.log_ops = {}
         self.img_ops = {}
 
+        n_domains = 2
         global_step = tf.Variable(0, trainable = False)
-        ae_enc = self.make_ae_enc()
-        ae_dec = self.make_ae_dec()
+        encs = [self.make_enc() for i in range(n_domains)]
+        ladder_enc = self.make_ladder_enc()
+        ladder_dec = self.make_ladder_dec()
+        decs = [self.make_dec() for i in range(n_domains)]
 
         def split_output(l):
             return l[:len(l)//2], l[len(l)//2:]
 
-        # reconstruction
-        x = tf.placeholder(tf.float32, shape = (None,) + self.img_shape)
-        y = tf.placeholder(tf.float32, shape = (None,) + self.img_shape)
-        outputs = ae_enc(x)
-        means, vars_ = split_output(outputs)
-        zs = []
-        noises = []
-        for mean, var in zip(means, vars_):
-            # sample from encoder distribution
-            z_shape = tf.shape(mean)
-            eps = tf.random_normal(z_shape, mean = 0.0, stddev = 1.0)
-            z = mean + tf.sqrt(var) * eps
-            zs.append(z)
-            # noise
-            noises.append(tf.random_normal(z_shape, mean = 0.0, stddev = 1.0))
+        # tensor flow
+        inputs = [tf.placeholder(tf.float32, shape = (None,) + self.img_shape) for i in range(n_domains)]
+        latent_vars = []
+        decodings = []
+        for i in range(n_domains):
+            encoding = encs[i](inputs[i])
 
-        x_rec = ae_dec(zs)
-        # generation
-        g = ae_dec(noises)
+            outputs = ladder_enc(encoding)
+            means, vars_ = split_output(outputs)
+            latent_vars.append((means, vars_))
+            zs = []
+            for mean, var in zip(means, vars_):
+                # sample from encoder distribution
+                z_shape = tf.shape(mean)
+                eps = tf.random_normal(z_shape, mean = 0.0, stddev = 1.0)
+                z = mean + tf.sqrt(var) * eps
+                zs.append(z)
+
+            ladder_decoding = ladder_dec(zs)
+            decodings.append([decs[j](ladder_decoding) for j in range(n_domains)])
+
+        # sampled latent space according to prior to produce samples
+        #noises = []
+        #for z_shape in self.z_shapes:
+        #    noises.append(tf.random_normal(z_shape, mean = 0.0, stddev = 1.0))
+        #ladder_decoding = ladder_dec(noises)
+        #gs = [decs[j](ladder_decoding) for j in range(n_domains)]
 
         # prior on latent space - kl distance to standard normal
         loss_latent = 0.0
-        for mean, var in zip(means, vars_):
-            loss_latent += 0.5 * tf.reduce_mean(tf.contrib.layers.flatten(
-                tf.square(mean) + var - tf.log(var) - 1.0)) / float(len(means))
+        for means, vars_ in latent_vars:
+            for mean, var in zip(means, vars_):
+                loss_latent += 0.5 * tf.reduce_mean(tf.contrib.layers.flatten(
+                    tf.square(mean) + var - tf.log(var) - 1.0)) / float(len(means)) / float(len(latent_vars))
+
         # likelihood - reconstruction loss
-        loss_reconstruction = tf.reduce_mean(tf.contrib.layers.flatten(
-            tf.square(y - x_rec)))
+        loss_reconstruction = 0.0
+        for i in range(n_domains):
+            for j in range(n_domains):
+                loss_reconstruction += tf.reduce_mean(tf.contrib.layers.flatten(
+                    tf.square(inputs[i] - decodings[j][i]))) / float(n_domains*n_domains)
         # increasing weight for latent loss
         # (beta - alpha)/(b - a) * (x - a) + alpha
         loss_latent_weight = tf.maximum(0.0,
                 (1.0 - 0.0) / (self.n_total_steps - self.begin_latent_loss) * (tf.cast(global_step, tf.float32) - self.begin_latent_loss) + 0.0)
-        loss = loss_latent_weight * loss_latent + loss_reconstruction
+        #loss = loss_latent_weight * loss_latent + loss_reconstruction
         #loss = 0.01*loss_latent + loss_reconstruction
-        #loss = loss_reconstruction
+        loss = loss_reconstruction
 
-        trainable_vars = ae_enc.trainable_weights + ae_dec.trainable_weights
+        trainable_vars = ladder_enc.trainable_weights + ladder_dec.trainable_weights
+        for i in range(n_domains):
+            trainable_vars += encs[i].trainable_weights + decs[i].trainable_weights
         logging.debug("Trainable vars: {}".format(len(trainable_vars)))
         learning_rate = tf.train.polynomial_decay(
                 learning_rate = self.initial_learning_rate,
@@ -458,15 +498,18 @@ class Model(object):
         optimizer = tf.train.AdamOptimizer(learning_rate = learning_rate)
         train = optimizer.minimize(loss, global_step = global_step, var_list = trainable_vars)
 
-        self.inputs = {"x": x, "y": y}
+        self.inputs = dict((i, inputs[i]) for i in range(n_domains))
         self.train_ops = {"train": train}
         self.log_ops = {
                 "loss": loss,
                 "global_step": global_step,
                 "learning_rate": learning_rate,
                 "loss_latent_weight": loss_latent_weight,
-                "mean_var": tf.reduce_mean(var)}
-        self.img_ops = {"x": x, "y": y, "x_rec": x_rec, "g": g}
+                "loss_latent": loss_latent,
+                "loss_reconstruction": loss_reconstruction}
+        self.img_ops = dict(
+                ("{}{}".format(i,j), decodings[i][j])
+                for i, j in itertools.product(range(n_domains), range(n_domains)))
 
 
     def init_graph(self):
@@ -478,8 +521,8 @@ class Model(object):
         for batch in trange(self.n_total_steps):
             X_batch, Y_batch = next(batches)
             feed_dict = {
-                    self.inputs["x"]: X_batch,
-                    self.inputs["y"]: Y_batch}
+                    self.inputs[0]: X_batch,
+                    self.inputs[1]: Y_batch}
             fetch_dict = {"train": self.train_ops}
             if self.log_ops["global_step"].eval(session) % self.log_frequency == 0:
                 fetch_dict["log"] = self.log_ops
@@ -510,8 +553,8 @@ class Model(object):
                 X_batch, Y_batch = next(self.valid_batches)
                 seen_batches += X_batch.shape[0]
                 feed_dict = {
-                        self.inputs["x"]: X_batch,
-                        self.inputs["y"]: Y_batch}
+                        self.inputs[0]: X_batch,
+                        self.inputs[1]: Y_batch}
                 fetch_dict = {
                         "log": self.log_ops,
                         "img": self.img_ops}
