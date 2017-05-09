@@ -255,9 +255,10 @@ class Model(object):
         self.initial_learning_rate = 1e-2
         self.end_learning_rate = 0.0
         self.n_total_steps = n_total_steps
-        self.begin_latent_loss = 0
+        self.begin_latent_weight = 0
+        self.final_latent_weight = 0.1
         self.begin_discrimination = 100
-        self.final_discrimination = 0.1
+        self.final_discrimination = 0.01
         self.log_frequency = 500
         self.define_graph()
         self.init_graph()
@@ -447,8 +448,10 @@ class Model(object):
         # increasing weight for latent loss
         # (beta - alpha)/(b - a) * (x - a) + alpha
         loss_latent_weight = tf.maximum(0.0,
-                (1.0 - 0.0) / (self.n_total_steps - self.begin_latent_loss) * (tf.cast(global_step, tf.float32) - self.begin_latent_loss) + 0.0)
-        loss = loss_latent_weight * 0.1 * loss_latent + loss_reconstruction
+                (self.final_latent_weight - 0.0) /
+                (self.n_total_steps - self.begin_latent_weight) *
+                (tf.cast(global_step, tf.float32) - self.begin_latent_weight) + 0.0)
+        loss = loss_latent_weight * loss_latent + loss_reconstruction
 
         # discriminator
         d_encs = [self.make_enc() for i in range(n_domains)]
@@ -533,7 +536,7 @@ class Model(object):
                         logits = d_logit_fake[(j,i)]))
         # discriminative losses for discriminator and generator
         d_loss_discriminator = 0.5 * (d_loss_real_as_real + d_loss_fake_as_fake)
-        d_loss_generator = 0.0*d_loss_fake_as_real
+        d_loss_generator = d_loss_fake_as_real
         # increasing weight for discrimination loss
         # (beta - alpha)/(b - a) * (x - a) + alpha
         discrimination_weight = tf.maximum(0.0,
@@ -579,16 +582,22 @@ class Model(object):
         self.train_ops = {"train": train, "d_train": d_train}
         self.log_ops = {
                 "loss": loss,
-                "d_loss": d_loss,
-                "d_loss_discriminator": d_loss_discriminator,
+                "loss_latent": loss_latent,
                 "d_loss_generator": d_loss_generator,
+                "loss_reconstruction": loss_reconstruction,
+
+                "d_loss": d_loss,
+                "d_loss_latent": d_loss_latent,
+                "d_loss_reconstruction_real": d_loss_reconstruction_real,
+                "d_loss_discriminator": d_loss_discriminator,
+                "d_loss_real_as_real": d_loss_real_as_real,
+                "d_loss_fake_as_fake": d_loss_fake_as_fake,
+
                 "global_step": global_step,
                 "learning_rate": learning_rate,
+                "d_learning_rate": d_learning_rate,
                 "loss_latent_weight": loss_latent_weight,
-                "discrimination_weight": discrimination_weight,
-                "loss_latent": loss_latent,
-                "d_loss_latent": loss_latent,
-                "loss_reconstruction": loss_reconstruction}
+                "discrimination_weight": discrimination_weight}
         self.img_ops = dict(
                 ("{}{}".format(i,j), decodings[i][j])
                 for i, j in itertools.product(range(n_domains), range(n_domains)))
