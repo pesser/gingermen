@@ -234,60 +234,6 @@ def keras_cnconv(x, kernel_size, filters, stride = 1, scale = 1.0):
     return result
 
 
-def keras_cndense(x, units):
-    init_standard_normal = keras.initializers.RandomNormal(
-            mean = 0.0,
-            stddev = 1.0)
-    dense_layer = keras.layers.Dense(units = units, kernel_initializer = init_standard_normal)
-    square_layer = keras.layers.Lambda(lambda x: K.square(x))
-    patch_l2_layer = keras.layers.Dense(units = units, kernel_initializer = "ones")
-    patch_l2_layer.trainable = False
-    normalize_layer = keras.layers.Lambda(lambda xy: xy[0] / (K.sqrt(xy[1]) + eps))
-
-    dense = dense_layer(x)
-    xsquare = square_layer(x)
-    patch_l2 = patch_l2_layer(xsquare)
-    eps = 1e-8
-    result = normalize_layer([dense, patch_l2])
-
-    return result
-
-
-def keras_dense(x, units):
-    return keras.layers.Dense(units = units, kernel_initializer = "he_normal")(x)
-
-
-def keras_scaled_conv(x, kernel_size, filters, stride = 1):
-    in_shape = K.int_shape(x)
-    fan_in = kernel_size*kernel_size*in_shape[-1]
-    stddev = 0.1 * 1.0 / math.sqrt(fan_in)
-    init_normal = keras.initializers.RandomNormal(
-            mean = 0.0,
-            stddev = stddev)
-    x = keras.layers.Conv2D(
-            filters = filters,
-            kernel_size = kernel_size,
-            strides = stride,
-            padding = "SAME",
-            kernel_initializer = init_normal)(x)
-    return x
-
-
-def keras_conv(x, kernel_size, filters, stride = 1):
-    x = keras.layers.Conv2D(
-            filters = filters,
-            kernel_size = kernel_size,
-            strides = stride,
-            padding = "SAME",
-            kernel_initializer = "he_normal")(x)
-    return x
-
-
-def keras_upsampling(x):
-    x = keras.layers.UpSampling2D()(x)
-    return x
-
-
 def keras_subpixel_upsampling(x):
     def lambda_subpixel(X):
         return tf.depth_to_space(X, 2)
@@ -299,14 +245,6 @@ def keras_activate(x, method = "relu"):
     return x
 
 
-def keras_flatten(x):
-    return keras.layers.Flatten()(x)
-
-
-def keras_reshape(x, target_shape):
-    return keras.layers.Reshape(target_shape)(x)
-
-
 def keras_concatenate(xs):
     return keras.layers.Concatenate(axis = -1)(xs)
 
@@ -314,20 +252,19 @@ def keras_concatenate(xs):
 class Model(object):
     def __init__(self, img_shape, n_total_steps):
         self.img_shape = img_shape
-        self.initial_learning_rate = 1e-3
-        if cnconv:
-            self.initial_learning_rate = 1e-2
+        self.initial_learning_rate = 1e-2
         self.end_learning_rate = 0.0
         self.n_total_steps = n_total_steps
-        self.begin_latent_loss = 0 #int(0.05 * n_total_steps)
-        self.start_ladder = 1
-        self.log_frequency = 100
+        self.begin_latent_loss = 0
+        self.begin_discrimination = 100
+        self.final_discrimination = 0.1
+        self.log_frequency = 500
         self.define_graph()
         self.init_graph()
 
 
     def make_enc(self):
-        n_features = 32
+        n_features = 16
         kernel_size = 3
 
         conv_op = keras_cnconv
@@ -350,7 +287,6 @@ class Model(object):
 
         conv_op = keras_cnconv
         activation_op = lambda x: keras_activate(x, "elu")
-        dense_op = keras_cndense
 
         means = []
         vars_ = []
@@ -379,7 +315,6 @@ class Model(object):
         concat_op = keras_concatenate
         conv_op = keras_cnconv
         activation_op = lambda x: keras_activate(x, "elu")
-        dense_op = keras_cndense
 
         inputs = []
         for z_shape in self.z_shapes:
@@ -421,48 +356,79 @@ class Model(object):
         return keras.models.Model(input_, output)
 
 
+    def make_classifier(self):
+        n_features = 512
+        kernel_size = 3
+        n_logits = self.n_domains + 1
+
+        conv_op = keras_cnconv
+        activation_op = lambda x: keras_activate(x, "elu")
+        global_avg_op = lambda x: keras.layers.pooling.GlobalAveragePooling2D()(x)
+
+        input_ = keras.layers.Input(shape = self.z_shapes[-1])
+        features = input_
+        features = conv_op(features, kernel_size, n_features)
+        features = conv_op(features, kernel_size, n_logits)
+        logits = global_avg_op(features)
+
+        return keras.models.Model(input_, logits)
+
+
     def define_graph(self):
         self.train_ops = {}
         self.log_ops = {}
         self.img_ops = {}
 
-        n_domains = 2
+        self.n_domains = n_domains = 2
         global_step = tf.Variable(0, trainable = False)
+
+        # generator
         encs = [self.make_enc() for i in range(n_domains)]
         ladder_enc = self.make_ladder_enc()
         ladder_dec = self.make_ladder_dec()
         decs = [self.make_dec() for i in range(n_domains)]
 
+        ladder_enc.summary()
+        ladder_dec.summary()
+        for i in range(n_domains):
+            encs[i].summary()
+            decs[i].summary()
+
+        # split output of ladder encoder into mean and variances
         def split_output(l):
             return l[:len(l)//2], l[len(l)//2:]
 
-        # tensor flow
         inputs = [tf.placeholder(tf.float32, shape = (None,) + self.img_shape) for i in range(n_domains)]
+
+        # generator tensor flow
         latent_vars = []
         decodings = []
         for i in range(n_domains):
+            # encode
             encoding = encs[i](inputs[i])
 
+            # sample from encoder distribution
             outputs = ladder_enc(encoding)
             means, vars_ = split_output(outputs)
             latent_vars.append((means, vars_))
             zs = []
             for mean, var in zip(means, vars_):
-                # sample from encoder distribution
                 z_shape = tf.shape(mean)
                 eps = tf.random_normal(z_shape, mean = 0.0, stddev = 1.0)
                 z = mean + tf.sqrt(var) * eps
                 zs.append(z)
 
+            # decode
             ladder_decoding = ladder_dec(zs)
             decodings.append([decs[j](ladder_decoding) for j in range(n_domains)])
 
         # sampled latent space according to prior to produce samples
-        #noises = []
-        #for z_shape in self.z_shapes:
-        #    noises.append(tf.random_normal(z_shape, mean = 0.0, stddev = 1.0))
-        #ladder_decoding = ladder_dec(noises)
-        #gs = [decs[j](ladder_decoding) for j in range(n_domains)]
+        batch_size = tf.shape(inputs[0])[0]
+        noises = []
+        for z_shape in self.z_shapes:
+            noises.append(tf.random_normal((batch_size,) + z_shape, mean = 0.0, stddev = 1.0))
+        ladder_decoding = ladder_dec(noises)
+        gs = [decs[j](ladder_decoding) for j in range(n_domains)]
 
         # prior on latent space - kl distance to standard normal
         loss_latent = 0.0
@@ -477,18 +443,113 @@ class Model(object):
             for j in range(n_domains):
                 loss_reconstruction += tf.reduce_mean(tf.contrib.layers.flatten(
                     tf.square(inputs[i] - decodings[j][i]))) / float(n_domains*n_domains)
+
         # increasing weight for latent loss
         # (beta - alpha)/(b - a) * (x - a) + alpha
         loss_latent_weight = tf.maximum(0.0,
                 (1.0 - 0.0) / (self.n_total_steps - self.begin_latent_loss) * (tf.cast(global_step, tf.float32) - self.begin_latent_loss) + 0.0)
-        #loss = loss_latent_weight * loss_latent + loss_reconstruction
-        #loss = 0.01*loss_latent + loss_reconstruction
-        loss = loss_reconstruction
+        loss = loss_latent_weight * 0.1 * loss_latent + loss_reconstruction
 
+        # discriminator
+        d_encs = [self.make_enc() for i in range(n_domains)]
+        d_ladder_enc = self.make_ladder_enc()
+        d_ladder_dec = self.make_ladder_dec()
+        d_decs = [self.make_dec() for i in range(n_domains)]
+        d_classifier = self.make_classifier()
+
+        d_latent_vars = []
+        d_decodings_real = []
+        d_logit_real = dict()
+        d_logit_fake = dict()
+        for i in range(n_domains):
+            # encode real images, i.e. inputs
+            d_encoding_real = d_encs[i](inputs[i])
+
+            # sample from encoder distribution
+            d_outputs_real = d_ladder_enc(d_encoding_real)
+            means, vars_ = split_output(d_outputs_real)
+            d_latent_vars.append((means, vars_))
+            zs = []
+            for mean, var in zip(means, vars_):
+                z_shape = tf.shape(mean)
+                eps = tf.random_normal(z_shape, mean = 0.0, stddev = 1.0)
+                z = mean + tf.sqrt(var) * eps
+                zs.append(z)
+
+            # decode
+            d_ladder_decoding_real = d_ladder_dec(zs)
+            d_decodings_real.append(d_decs[i](d_ladder_decoding_real))
+            # classify
+            d_logit_real[i] = d_classifier(zs[-1])
+
+            for j in range(n_domains):
+                if j != i:
+                    # encode translated images
+                    d_encoding_fake = d_encs[i](decodings[j][i])
+
+                    d_outputs_fake = d_ladder_enc(d_encoding_fake)
+                    means, vars_ = split_output(d_outputs_fake)
+                    mean, var = means[-1], vars_[-1]
+                    # sample from highest encoder distribution
+                    z_shape = tf.shape(mean)
+                    eps = tf.random_normal(z_shape, mean = 0.0, stddev = 1.0)
+                    z = mean + tf.sqrt(var) * eps
+                    # classify
+                    d_logit_fake[(j, i)] = d_classifier(z)
+
+        # prior on latent space of discriminator - kl distance to standard normal
+        d_loss_latent = 0.0
+        for means, vars_ in d_latent_vars:
+            for mean, var in zip(means, vars_):
+                d_loss_latent += 0.5 * tf.reduce_mean(tf.contrib.layers.flatten(
+                    tf.square(mean) + var - tf.log(var) - 1.0)) / float(len(means)) / float(len(d_latent_vars))
+
+        # likelihood for discriminator - reconstruction loss of real images
+        d_loss_reconstruction_real = 0.0
+        for i in range(n_domains):
+            d_loss_reconstruction_real += tf.reduce_mean(tf.contrib.layers.flatten(
+                tf.square(inputs[i] - d_decodings_real[i]))) / float(n_domains)
+        # loss for classification of real images as real
+        d_loss_real_as_real = 0.0
+        for i in range(n_domains):
+            d_loss_real_as_real += tf.reduce_mean(tf.nn.sparse_softmax_cross_entropy_with_logits(
+                labels = i * tf.ones(shape = (tf.shape(d_logit_real[i])[0],), dtype = tf.int32),
+                logits = d_logit_real[i]))
+        # loss for classification of fake images as fake
+        d_loss_fake_as_fake = 0.0
+        for i in range(n_domains):
+            for j in range(n_domains):
+                if j != i:
+                    d_loss_fake_as_fake += tf.reduce_mean(tf.nn.sparse_softmax_cross_entropy_with_logits(
+                        labels = n_domains * tf.ones(shape = (tf.shape(d_logit_fake[(j,i)])[0],), dtype = tf.int32),
+                        logits = d_logit_fake[(j,i)]))
+        # loss for classification of fake images as real - additional objective for generator
+        d_loss_fake_as_real = 0.0
+        for i in range(n_domains):
+            for j in range(n_domains):
+                if j != i:
+                    d_loss_fake_as_real += tf.reduce_mean(tf.nn.sparse_softmax_cross_entropy_with_logits(
+                        labels = i * tf.ones(shape = (tf.shape(d_logit_fake[(j,i)])[0],), dtype = tf.int32),
+                        logits = d_logit_fake[(j,i)]))
+        # discriminative losses for discriminator and generator
+        d_loss_discriminator = 0.5 * (d_loss_real_as_real + d_loss_fake_as_fake)
+        d_loss_generator = 0.0*d_loss_fake_as_real
+        # increasing weight for discrimination loss
+        # (beta - alpha)/(b - a) * (x - a) + alpha
+        discrimination_weight = tf.maximum(0.0,
+                (self.final_discrimination - 0.0) /
+                (self.n_total_steps - self.begin_discrimination) *
+                (tf.cast(global_step, tf.float32) - self.begin_discrimination) + 0.0)
+        # discriminator loss
+        d_loss = d_loss_latent + d_loss_reconstruction_real + discrimination_weight * d_loss_discriminator
+        # add discriminative loss of translations to generator loss
+        loss += discrimination_weight * d_loss_generator
+
+        # g training
         trainable_vars = ladder_enc.trainable_weights + ladder_dec.trainable_weights
         for i in range(n_domains):
             trainable_vars += encs[i].trainable_weights + decs[i].trainable_weights
-        logging.debug("Trainable vars: {}".format(len(trainable_vars)))
+        logging.debug("Generator trainable vars: {}".format(len(trainable_vars)))
         learning_rate = tf.train.polynomial_decay(
                 learning_rate = self.initial_learning_rate,
                 global_step = global_step,
@@ -498,21 +559,53 @@ class Model(object):
         optimizer = tf.train.AdamOptimizer(learning_rate = learning_rate)
         train = optimizer.minimize(loss, global_step = global_step, var_list = trainable_vars)
 
+        # d training - TODO: could weaken discriminator additionally by
+        # shared encoder and decoder for all domains
+        d_trainable_vars = d_ladder_enc.trainable_weights + d_ladder_dec.trainable_weights + d_classifier.trainable_weights
+        for i in range(n_domains):
+            d_trainable_vars += d_encs[i].trainable_weights + d_decs[i].trainable_weights
+        logging.debug("Discriminator trainable vars: {}".format(len(d_trainable_vars)))
+        d_learning_rate = tf.train.polynomial_decay(
+                learning_rate = self.initial_learning_rate,
+                global_step = global_step,
+                decay_steps = self.n_total_steps,
+                end_learning_rate = self.end_learning_rate,
+                power = 1.0)
+        d_optimizer = tf.train.AdamOptimizer(learning_rate = d_learning_rate)
+        d_train = d_optimizer.minimize(d_loss, var_list = d_trainable_vars)
+
+        # ops
         self.inputs = dict((i, inputs[i]) for i in range(n_domains))
-        self.train_ops = {"train": train}
+        self.train_ops = {"train": train, "d_train": d_train}
         self.log_ops = {
                 "loss": loss,
+                "d_loss": d_loss,
+                "d_loss_discriminator": d_loss_discriminator,
+                "d_loss_generator": d_loss_generator,
                 "global_step": global_step,
                 "learning_rate": learning_rate,
                 "loss_latent_weight": loss_latent_weight,
+                "discrimination_weight": discrimination_weight,
                 "loss_latent": loss_latent,
+                "d_loss_latent": loss_latent,
                 "loss_reconstruction": loss_reconstruction}
         self.img_ops = dict(
                 ("{}{}".format(i,j), decodings[i][j])
                 for i, j in itertools.product(range(n_domains), range(n_domains)))
+        self.img_ops.update(dict(
+            ("g{}".format(j), gs[j]) for j in range(n_domains)))
+        self.img_ops.update(dict(
+            ("d{}".format(j), d_decodings_real[j]) for j in range(n_domains)))
+
+        for k, v in self.log_ops.items():
+            tf.summary.scalar(k, v)
+        self.summary_op = tf.summary.merge_all()
 
 
     def init_graph(self):
+        self.writer = tf.summary.FileWriter(
+                out_dir,
+                session.graph)
         session.run(tf.global_variables_initializer())
 
 
@@ -524,21 +617,26 @@ class Model(object):
                     self.inputs[0]: X_batch,
                     self.inputs[1]: Y_batch}
             fetch_dict = {"train": self.train_ops}
+            kwargs = {}
             if self.log_ops["global_step"].eval(session) % self.log_frequency == 0:
                 fetch_dict["log"] = self.log_ops
                 fetch_dict["img"] = self.img_ops
-            result = session.run(fetch_dict, feed_dict)
-            self.log_result(result)
+                fetch_dict["summary"] = self.summary_op
+            result = session.run(fetch_dict, feed_dict, **kwargs)
+            self.log_result(result, **kwargs)
 
 
-    def log_result(self, result):
+    def log_result(self, result, **kwargs):
+        global_step = self.log_ops["global_step"].eval(session)
+        if "summary" in result:
+            self.writer.add_summary(result["summary"], global_step)
+            self.writer.flush()
         if "log" in result:
             for k, v in result["log"].items():
                 if type(v) == float:
                     v = "{:.4e}".format(v)
                 logging.info("{}: {}".format(k, v))
         if "img" in result:
-            global_step = self.log_ops["global_step"].eval(session)
             for k, v in result["img"].items():
                 plot_images(v, k + "_{:07}".format(global_step))
             self.validate()
@@ -549,7 +647,9 @@ class Model(object):
             global_step = self.log_ops["global_step"].eval(session)
             seen_batches = 0
             losses = []
-            while seen_batches < self.valid_batches.n:
+            #while seen_batches < self.valid_batches.n:
+            # just use a single batch of validation data to speed things up
+            for i in range(1):
                 X_batch, Y_batch = next(self.valid_batches)
                 seen_batches += X_batch.shape[0]
                 feed_dict = {
