@@ -257,9 +257,9 @@ class Model(object):
         self.n_total_steps = n_total_steps
         self.begin_latent_weight = 0
         self.final_latent_weight = 0.1
-        self.begin_discrimination = 100
-        self.final_discrimination = 0.01
-        self.log_frequency = 500
+        self.begin_discrimination = 250
+        self.final_discrimination = 0.00
+        self.log_frequency = 250
         self.define_graph()
         self.init_graph()
 
@@ -357,19 +357,21 @@ class Model(object):
         return keras.models.Model(input_, output)
 
 
-    def make_classifier(self):
-        n_features = 512
+    def make_discriminator(self):
+        n_downsamplings = 6
+        n_features = 32
         kernel_size = 3
-        n_logits = self.n_domains + 1
 
         conv_op = keras_cnconv
         activation_op = lambda x: keras_activate(x, "elu")
         global_avg_op = lambda x: keras.layers.pooling.GlobalAveragePooling2D()(x)
 
-        input_ = keras.layers.Input(shape = self.z_shapes[-1])
+        input_ = keras.layers.Input(shape = self.img_shape)
         features = input_
-        features = conv_op(features, kernel_size, n_features)
-        features = conv_op(features, kernel_size, n_logits)
+        for i in range(n_downsamplings):
+            features = conv_op(features, kernel_size, 2**i*n_features, stride = 2)
+            features = activation_op(features)
+        features = conv_op(features, 1, 1)
         logits = global_avg_op(features)
 
         return keras.models.Model(input_, logits)
@@ -454,99 +456,36 @@ class Model(object):
         loss = loss_latent_weight * loss_latent + loss_reconstruction
 
         # discriminator
-        d_encs = [self.make_enc() for i in range(n_domains)]
-        d_ladder_enc = self.make_ladder_enc()
-        d_ladder_dec = self.make_ladder_dec()
-        d_decs = [self.make_dec() for i in range(n_domains)]
-        d_classifier = self.make_classifier()
+        # only first domain
+        n_domains = 1
+        discriminators = [self.make_discriminator() for i in range(n_domains)]
+        real_logits = [discriminators[i](inputs[i]) for i in range(n_domains)]
+        fake_logits = [discriminators[i](gs[i]) for i in range(n_domains)]
+        real_real_entropies = [
+                tf.losses.sigmoid_cross_entropy(
+                    multi_class_labels = tf.ones_like(real_logits[i]),
+                    logits = real_logits[i]) for i in range(n_domains)]
+        real_real_entropy = tf.add_n(real_real_entropies) / n_domains
+        fake_fake_entropies = [
+                tf.losses.sigmoid_cross_entropy(
+                    multi_class_labels = tf.zeros_like(fake_logits[i]),
+                    logits = fake_logits[i]) for i in range(n_domains)]
+        fake_fake_entropy = tf.add_n(fake_fake_entropies) / n_domains
+        fake_real_entropies = [
+                tf.losses.sigmoid_cross_entropy(
+                    multi_class_labels = tf.ones_like(fake_logits[i]),
+                    logits = fake_logits[i]) for i in range(n_domains)]
+        fake_real_entropy = tf.add_n(fake_real_entropies) / n_domains
+        d_loss = real_real_entropy + fake_fake_entropy
 
-        d_latent_vars = []
-        d_decodings_real = []
-        d_logit_real = dict()
-        d_logit_fake = dict()
-        for i in range(n_domains):
-            # encode real images, i.e. inputs
-            d_encoding_real = d_encs[i](inputs[i])
-
-            # sample from encoder distribution
-            d_outputs_real = d_ladder_enc(d_encoding_real)
-            means, vars_ = split_output(d_outputs_real)
-            d_latent_vars.append((means, vars_))
-            zs = []
-            for mean, var in zip(means, vars_):
-                z_shape = tf.shape(mean)
-                eps = tf.random_normal(z_shape, mean = 0.0, stddev = 1.0)
-                z = mean + tf.sqrt(var) * eps
-                zs.append(z)
-
-            # decode
-            d_ladder_decoding_real = d_ladder_dec(zs)
-            d_decodings_real.append(d_decs[i](d_ladder_decoding_real))
-            # classify
-            d_logit_real[i] = d_classifier(zs[-1])
-
-            for j in range(n_domains):
-                if j != i:
-                    # encode translated images
-                    d_encoding_fake = d_encs[i](decodings[j][i])
-
-                    d_outputs_fake = d_ladder_enc(d_encoding_fake)
-                    means, vars_ = split_output(d_outputs_fake)
-                    mean, var = means[-1], vars_[-1]
-                    # sample from highest encoder distribution
-                    z_shape = tf.shape(mean)
-                    eps = tf.random_normal(z_shape, mean = 0.0, stddev = 1.0)
-                    z = mean + tf.sqrt(var) * eps
-                    # classify
-                    d_logit_fake[(j, i)] = d_classifier(z)
-
-        # prior on latent space of discriminator - kl distance to standard normal
-        d_loss_latent = 0.0
-        for means, vars_ in d_latent_vars:
-            for mean, var in zip(means, vars_):
-                d_loss_latent += 0.5 * tf.reduce_mean(tf.contrib.layers.flatten(
-                    tf.square(mean) + var - tf.log(var) - 1.0)) / float(len(means)) / float(len(d_latent_vars))
-
-        # likelihood for discriminator - reconstruction loss of real images
-        d_loss_reconstruction_real = 0.0
-        for i in range(n_domains):
-            d_loss_reconstruction_real += tf.reduce_mean(tf.contrib.layers.flatten(
-                tf.square(inputs[i] - d_decodings_real[i]))) / float(n_domains)
-        # loss for classification of real images as real
-        d_loss_real_as_real = 0.0
-        for i in range(n_domains):
-            d_loss_real_as_real += tf.reduce_mean(tf.nn.sparse_softmax_cross_entropy_with_logits(
-                labels = i * tf.ones(shape = (tf.shape(d_logit_real[i])[0],), dtype = tf.int32),
-                logits = d_logit_real[i]))
-        # loss for classification of fake images as fake
-        d_loss_fake_as_fake = 0.0
-        for i in range(n_domains):
-            for j in range(n_domains):
-                if j != i:
-                    d_loss_fake_as_fake += tf.reduce_mean(tf.nn.sparse_softmax_cross_entropy_with_logits(
-                        labels = n_domains * tf.ones(shape = (tf.shape(d_logit_fake[(j,i)])[0],), dtype = tf.int32),
-                        logits = d_logit_fake[(j,i)]))
-        # loss for classification of fake images as real - additional objective for generator
-        d_loss_fake_as_real = 0.0
-        for i in range(n_domains):
-            for j in range(n_domains):
-                if j != i:
-                    d_loss_fake_as_real += tf.reduce_mean(tf.nn.sparse_softmax_cross_entropy_with_logits(
-                        labels = i * tf.ones(shape = (tf.shape(d_logit_fake[(j,i)])[0],), dtype = tf.int32),
-                        logits = d_logit_fake[(j,i)]))
-        # discriminative losses for discriminator and generator
-        d_loss_discriminator = 0.5 * (d_loss_real_as_real + d_loss_fake_as_fake)
-        d_loss_generator = d_loss_fake_as_real
-        # increasing weight for discrimination loss
+        # increasing weight for discriminative loss of generator
         # (beta - alpha)/(b - a) * (x - a) + alpha
-        discrimination_weight = tf.maximum(0.0,
+        loss_discrimination_weight = tf.maximum(0.0,
                 (self.final_discrimination - 0.0) /
                 (self.n_total_steps - self.begin_discrimination) *
                 (tf.cast(global_step, tf.float32) - self.begin_discrimination) + 0.0)
-        # discriminator loss
-        d_loss = d_loss_latent + d_loss_reconstruction_real + discrimination_weight * d_loss_discriminator
-        # add discriminative loss of translations to generator loss
-        loss += discrimination_weight * d_loss_generator
+        loss += loss_discrimination_weight * fake_real_entropy
+        n_domains = 2
 
         # g training
         trainable_vars = ladder_enc.trainable_weights + ladder_dec.trainable_weights
@@ -559,23 +498,26 @@ class Model(object):
                 decay_steps = self.n_total_steps,
                 end_learning_rate = self.end_learning_rate,
                 power = 1.0)
-        optimizer = tf.train.AdamOptimizer(learning_rate = learning_rate)
+        optimizer = tf.train.AdamOptimizer(
+                learning_rate = learning_rate, beta1 = 0.5, beta2 = 0.9)
         train = optimizer.minimize(loss, global_step = global_step, var_list = trainable_vars)
 
-        # d training - TODO: could weaken discriminator additionally by
-        # shared encoder and decoder for all domains
-        d_trainable_vars = d_ladder_enc.trainable_weights + d_ladder_dec.trainable_weights + d_classifier.trainable_weights
+        # d training
+        n_domains = 1
+        d_trainable_vars = []
         for i in range(n_domains):
-            d_trainable_vars += d_encs[i].trainable_weights + d_decs[i].trainable_weights
+            d_trainable_vars += discriminators[i].trainable_weights
         logging.debug("Discriminator trainable vars: {}".format(len(d_trainable_vars)))
         d_learning_rate = tf.train.polynomial_decay(
-                learning_rate = self.initial_learning_rate,
+                learning_rate = 1e-3,
                 global_step = global_step,
                 decay_steps = self.n_total_steps,
                 end_learning_rate = self.end_learning_rate,
                 power = 1.0)
-        d_optimizer = tf.train.AdamOptimizer(learning_rate = d_learning_rate)
+        d_optimizer = tf.train.AdamOptimizer(
+                learning_rate = d_learning_rate, beta1 = 0.5, beta2 = 0.9)
         d_train = d_optimizer.minimize(d_loss, var_list = d_trainable_vars)
+        n_domains = 2
 
         # ops
         self.inputs = dict((i, inputs[i]) for i in range(n_domains))
@@ -583,28 +525,24 @@ class Model(object):
         self.log_ops = {
                 "loss": loss,
                 "loss_latent": loss_latent,
-                "d_loss_generator": d_loss_generator,
                 "loss_reconstruction": loss_reconstruction,
 
                 "d_loss": d_loss,
-                "d_loss_latent": d_loss_latent,
-                "d_loss_reconstruction_real": d_loss_reconstruction_real,
-                "d_loss_discriminator": d_loss_discriminator,
-                "d_loss_real_as_real": d_loss_real_as_real,
-                "d_loss_fake_as_fake": d_loss_fake_as_fake,
+                "real_real_entropy": real_real_entropy,
+                "fake_fake_entropy": fake_fake_entropy,
+                "fake_real_entropy": fake_real_entropy,
 
                 "global_step": global_step,
                 "learning_rate": learning_rate,
                 "d_learning_rate": d_learning_rate,
                 "loss_latent_weight": loss_latent_weight,
-                "discrimination_weight": discrimination_weight}
+                "loss_discrimination_weight": loss_discrimination_weight}
+                #"discrimination_weight": discrimination_weight}
         self.img_ops = dict(
                 ("{}{}".format(i,j), decodings[i][j])
                 for i, j in itertools.product(range(n_domains), range(n_domains)))
         self.img_ops.update(dict(
             ("g{}".format(j), gs[j]) for j in range(n_domains)))
-        self.img_ops.update(dict(
-            ("d{}".format(j), d_decodings_real[j]) for j in range(n_domains)))
 
         for k, v in self.log_ops.items():
             tf.summary.scalar(k, v)
