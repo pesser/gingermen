@@ -327,7 +327,8 @@ class Model(object):
             session.run(tf.global_variables_initializer())
 
 
-    def fit(self, batches):
+    def fit(self, batches, valid_batches = None):
+        self.valid_batches = valid_batches
         for batch in trange(self.n_total_steps):
             X_batch, Y_batch = next(batches)
             feed_dict = {
@@ -355,6 +356,15 @@ class Model(object):
         if "img" in result:
             for k, v in result["img"].items():
                 plot_images(v, k + "_{:07}".format(global_step))
+            if self.valid_batches is not None:
+                # validation samples
+                X_batch, Y_batch = next(self.valid_batches)
+                feed_dict = {
+                        self.inputs[0]: X_batch,
+                        self.inputs[1]: Y_batch}
+                imgs = session.run(self.img_ops, feed_dict)
+                for k, v in imgs.items():
+                    plot_images(v, "valid_" + k + "_{:07}".format(global_step))
         if global_step % self.save_frequency == self.save_frequency - 1:
             fname = os.path.join(self.checkpoint_dir, "model.ckpt")
             self.saver.save(
@@ -525,8 +535,10 @@ if __name__ == "__main__":
     init_logging()
     batches = get_batches("train", img_shape, batch_size, ["x", "y"])
     logging.info("Number of training samples: {}".format(batches.n))
+    valid_batches = get_batches("valid", img_shape, batch_size, ["x", "y"])
+    logging.info("Number of validation samples: {}".format(valid_batches.n))
 
     n_epochs = 100
     n_total_steps = int(n_epochs * batches.n / batch_size)
     model = Model(img_shape, n_total_steps, restore_path)
-    model.fit(batches)
+    model.fit(batches, valid_batches)
