@@ -6,16 +6,11 @@ import keras.backend as K
 K.set_session(session)
 import keras
 
-import os, logging, shutil, datetime, socket, time, math, functools, itertools
+import os, sys, logging, shutil, datetime, socket, time, math, functools, itertools
 import numpy as np
 from multiprocessing.pool import ThreadPool
-from keras.preprocessing.image import ImageDataGenerator, load_img, img_to_array
-from PIL import Image
+import PIL.Image
 from tqdm import tqdm, trange
-
-
-grayscale = False
-cnconv = True
 
 
 data_dir = os.path.join(os.getcwd(), "data")
@@ -66,37 +61,34 @@ class BufferedWrapper(object):
         return result
 
 
-def preprocessing_function(x):
+def load_img(path, target_size):
+    img = PIL.Image.open(path)
+    grayscale = target_size[2] == 1
+    if grayscale:
+        if img.mode != 'L':
+            img = img.convert('L')
+    else:
+        if img.mode != 'RGB':
+            img = img.convert('RGB')
+    wh_tuple = (target_size[1], target_size[0])
+    if img.size != wh_tuple:
+        img = img.resize(wh_tuple, resample = PIL.Image.BILINEAR)
+
+    x = np.asarray(img, dtype = "uint8")
     x = x / 127.5 - 1.0
+    if len(x.shape) == 2:
+        x = np.expand_dims(x, -1)
+
     return x
 
 
-def get_batches(img_shape, batch_size):
-    generator = ImageDataGenerator(preprocessing_function = preprocessing_function)
-    hostname = socket.gethostname()
-    color_mode = "grayscale" if grayscale else "rgb"
-    # TODO keras uses nearest-neighbor downsampling (via pillow) for
-    # resizing but reference implementation uses bilinear downsampling
-    batches = generator.flow_from_directory(
-            data_dir,
-            target_size = img_shape[:2],
-            color_mode = color_mode,
-            class_mode = None,
-            classes = [hostname],
-            batch_size = batch_size,
-            shuffle = True)
-
-    return BufferedWrapper(batches)
-
-
 class FileFlow(object):
-    def __init__(self, batch_size, img_shape, paths, preprocessing_function):
+    def __init__(self, batch_size, img_shape, paths):
         fnames = list(set(fname for fname in os.listdir(path) if fname.endswith(".jpg")) for path in paths)
         fnames = list(functools.reduce(lambda a, b: a & b, fnames))
         self.batch_size = batch_size
         self.img_shape = img_shape
         self.paths = paths
-        self.preprocessing_function = preprocessing_function
         self.fnames = fnames
         self.n = len(fnames)
         logging.info("Found {} images.".format(self.n))
@@ -113,13 +105,9 @@ class FileFlow(object):
         grayscale = self.img_shape[2] == 1
         batches = []
         for path in self.paths:
-            path_batch = np.zeros((current_batch_size,) + self.img_shape, dtype = K.floatx())
+            path_batch = np.zeros((current_batch_size,) + self.img_shape, dtype = "float32")
             for i, fname in enumerate(batch_fnames):
-                img = load_img(os.path.join(path, fname),
-                               grayscale = grayscale,
-                               target_size = self.img_shape[:2])
-                x = img_to_array(img)
-                x = self.preprocessing_function(x)
+                x = load_img(os.path.join(path, fname), target_size = self.img_shape)
                 path_batch[i] = x
             batches.append(path_batch)
 
@@ -136,15 +124,10 @@ class FileFlow(object):
         self.indices = np.random.permutation(self.n)
 
 
-def get_paired_batches(split, img_shape, batch_size):
+def get_batches(split, img_shape, batch_size, names):
     hostname = socket.gethostname()
-    xdomain_dir = os.path.join(data_dir, hostname, split, "x")
-    ydomain_dir = os.path.join(data_dir, hostname, split, "y")
-
-    flow = FileFlow(batch_size, img_shape, [xdomain_dir, ydomain_dir], preprocessing_function)
-    #flow = FileFlow(batch_size, img_shape, [ydomain_dir, ydomain_dir], preprocessing_function)
-    #flow = FileFlow(batch_size, img_shape, [xdomain_dir, xdomain_dir], preprocessing_function)
-    #flow = FileFlow(batch_size, img_shape, [ydomain_dir, xdomain_dir], preprocessing_function)
+    domain_dirs = [os.path.join(data_dir, hostname, split, name) for name in names]
+    flow = FileFlow(batch_size, img_shape, domain_dirs)
     return BufferedWrapper(flow)
 
 
@@ -171,69 +154,10 @@ def plot_images(X, name):
     canvas = tile(X, rows, cols)
     fname = os.path.join(out_dir, name + ".png")
     canvas = np.squeeze(canvas)
-    Image.fromarray(np.uint8(255*canvas)).save(fname)
+    PIL.Image.fromarray(np.uint8(255*canvas)).save(fname)
 
 
-class CNConv2D(keras.engine.topology.Layer):
-    def __init__(self, kernel_size, filters, stride, **kwargs):
-        self.kernel_size = kernel_size
-        self.output_features = filters
-        self.stride = stride
-        self.strides = (1, self.stride, self.stride, 1)
-        self.padding = "SAME"
-        self.initializer = init_standard_normal = keras.initializers.RandomNormal(mean = 0.0, stddev = 1.0)
-        super(CNConv2D, self).__init__(**kwargs)
-
-
-    def build(self, input_shape):
-        assert(len(input_shape) == 4)
-        input_features = input_shape[3]
-        self.kernel_shape = (self.kernel_size, self.kernel_size, input_features, self.output_features)
-        self.kernel = self.add_weight(
-                name = "kernel",
-                shape = self.kernel_shape,
-                initializer = self.initializer,
-                trainable = True)
-        self.bias = self.add_weight(
-                name = "bias",
-                shape = (self.output_features,),
-                initializer = "zeros",
-                trainable = True)
-        super(CNConv2D, self).build(input_shape)
-
-
-    def call(self, x):
-        normalization = tf.sqrt(tf.nn.conv2d(
-                tf.square(x),
-                tf.ones(self.kernel_shape),
-                strides = self.strides,
-                padding = self.padding)) + 1e-6
-        x = tf.nn.conv2d(
-                x,
-                self.kernel,
-                strides = self.strides,
-                padding = self.padding)
-        x = x / normalization
-        x = tf.nn.bias_add(x, self.bias)
-        return x
-
-
-    def compute_output_shape(self, input_shape):
-        space = input_shape[1:-1]
-        new_space = []
-        for i in range(len(space)):
-            new_dim = keras.utils.conv_utils.conv_output_length(
-                space[i],
-                self.kernel_size,
-                padding = self.padding.lower(),
-                stride = self.stride)
-            new_space.append(new_dim)
-        return (input_shape[0],) + tuple(new_space) + (self.output_features,)
-
-
-def keras_cnconv(x, kernel_size, filters, stride = 1, scale = 1.0):
-    result = CNConv2D(kernel_size, filters, stride)(x)
-    return result
+kernel_initializer = "glorot_uniform"
 
 
 def keras_subpixel_upsampling(x):
@@ -253,36 +177,30 @@ def keras_concatenate(xs):
     return keras.layers.Concatenate(axis = -1)(xs)
 
 
-kernel_initializer = "glorot_uniform"
-global_kernel_size = 5
-
-
 def keras_dense_to_conv(x, spatial, features):
     x = keras.layers.Dense(units = spatial*spatial*features,
             kernel_initializer = kernel_initializer)(x)
     return keras.layers.Reshape((spatial, spatial, features))(x)
 
 
-def keras_normalize(x, training):
-    l = keras.layers.BatchNormalization(momentum = 0.9, epsilon = 1e-5)
-    n = l(x, training = training)
-    return n
+def keras_normalize(x):
+    return keras.layers.BatchNormalization(momentum = 0.9, epsilon = 1e-5)(x, training = False)
 
 
-def keras_conv(x, filters, stride = 1):
+def keras_conv(x, kernel_size, filters, stride = 1):
     return keras.layers.Conv2D(
             filters = filters,
-            kernel_size = global_kernel_size,
+            kernel_size = kernel_size,
             strides = stride,
             padding = "SAME",
             kernel_initializer = kernel_initializer)(x)
 
 
-def keras_deconv(x, filters):
+def keras_conv_transposed(x, kernel_size, filters, stride = 1):
     return keras.layers.Conv2DTranspose(
             filters = filters,
-            kernel_size = global_kernel_size,
-            strides = 2,
+            kernel_size = kernel_size,
+            strides = stride,
             padding = "SAME",
             kernel_initializer = kernel_initializer)(x)
 
@@ -296,67 +214,32 @@ def kerasify(x):
     return keras.layers.InputLayer(input_shape = K.int_shape(x)[1:])(x)
 
 
+def make_linear_var(self,
+        step,
+        start, end,
+        start_value, end_value,
+        clip_min = 0.0, clip_max = 1.0):
+    # linear from (a, alpha) to (b, beta)
+    # (beta - alpha)/(b - a) * (x - a) + alpha
+    linear = (
+            (end_value - start_value) /
+            (end - start) *
+            (tf.cast(step, tf.float32) - start) + start_value)
+    return tf.clip_by_value(linear, clip_min, clip_max)
+
+
 class Model(object):
-    def __init__(self, img_shape, n_total_steps):
+    def __init__(self, img_shape, n_total_steps, restore_path = None):
         self.img_shape = img_shape
-        self.lr = 2e-4
-        self.end_learning_rate = 0.0
+        self.lr = 1e-4
         self.n_total_steps = n_total_steps
-        self.begin_latent_weight = 0
-        self.final_latent_weight = 0.1
-        self.begin_discrimination = 250
-        self.final_discrimination = 0.00
-        self.log_frequency = 250
+        self.log_frequency = 50
+        self.save_frequency = 500
         self.define_graph()
+        self.restore_path = restore_path
+        self.checkpoint_dir = os.path.join(out_dir, "checkpoints")
+        os.makedirs(self.checkpoint_dir, exist_ok = True)
         self.init_graph()
-
-
-    def make_dc_gen(self):
-        target_size = self.img_shape[0]
-        n_upsamplings = 4
-        coarsest_size = target_size // (2**n_upsamplings)
-        n_features = 64
-        training = self.g_training_phase
-
-        z = keras.layers.Input((self.latent_dim,))
-
-        features = z
-        features = keras_dense_to_conv(
-                features,
-                spatial = coarsest_size,
-                features = 2**(n_upsamplings - 1) * n_features)
-        features = keras_normalize(features, training)
-        features = keras_activate(features, "relu")
-        for i in range(n_upsamplings - 1):
-            nf = 2**(n_upsamplings - 2 - i) * n_features
-            features = keras_deconv(features, nf)
-            features = keras_normalize(features, training)
-            features = keras_activate(features, "relu")
-        g = keras_deconv(features, 3)
-        g = keras_activate(g, "tanh")
-
-        return keras.models.Model(z, g)
-
-
-    def make_dc_dis(self):
-        n_downsamplings = 4
-        n_features = 64
-        training = 0
-
-        # inputs
-        x = keras.layers.Input(self.img_shape)
-
-        features = x
-        features = keras_conv(features, n_features, stride = 2)
-        features = keras_activate(features, "leakyrelu")
-        for i in range(1, n_downsamplings):
-            features = keras_conv(features, n_features * 2**i, stride = 2)
-            features = keras_normalize(features, training)
-            features = keras_activate(features, "leakyrelu")
-        logit = keras_to_dense(features, 1)
-
-        return keras.models.Model(x, logit)
-
 
 
     def define_graph(self):
@@ -367,88 +250,65 @@ class Model(object):
         self.img_ops = {}
 
         global_step = tf.Variable(0, trainable = False)
-        # variables to switch batch normalization behaviour of the models
-        self.g_training_phase = tf.Variable(False, trainable = False, dtype = tf.bool)
 
-        g = self.make_dc_gen()
-        d = self.make_dc_dis()
+        n_domains = 2
 
-        input_ = tf.placeholder(tf.float32, shape = (None,) + self.img_shape)
-        #batch_size = 64
-        batch_size = tf.shape(input_)[0]
-        z = tf.random_uniform((batch_size, self.latent_dim), minval = -1.0, maxval = 1.0)
+        # adjacency matrix of active streams with (i,j) indicating stream
+        # from domain i to domain j
+        streams = np.zeros((n_domains, n_domains), dtype = np.bool)
+        streams[0,0] = True
+        streams[1,0] = True
 
-        # linear from (a, alpha) to (b, beta)
-        # (beta - alpha)/(b - a) * (x - a) + alpha
-        noise_level = tf.maximum(0.0,
-                (0.0 - 1.0) /
-                (self.n_total_steps - 0) *
-                (tf.cast(global_step, tf.float32) - 0) + 1.0)
-        input_noise = tf.random_normal(tf.shape(input_), mean = 0.0, stddev = noise_level)
-        fake_noise1 = tf.random_normal(tf.shape(input_), mean = 0.0, stddev = noise_level)
-        fake_noise2 = tf.random_normal(tf.shape(input_), mean = 0.0, stddev = noise_level)
+        # encoder-decoder pipeline
+        head_encs = [self.make_det_enc(self.img_shape, n_features = 64, n_layers = 2) for i in range(n_domains)]
+        head_output_shape = K.int_shape(head_encs[0].outputs[0])[1:]
+        shared_enc = self.make_enc(head_output_shape, n_features = 256, n_layers = 3)
+        shared_dec = self.make_dec(head_output_shape, n_features = 256, n_layers = 3)
+        tail_decs = [self.make_det_dec(self.img_shape, n_features = 64, n_layers = 2) for i in range(n_domains)]
 
-        x = kerasify(input_)
-        xnoise = kerasify(x + input_noise)
+        # supervised g training, i.e. x and y are correpsonding pairs
+        inputs = [tf.placeholder(tf.float32, shape = (None,) + self.img_shape) for i in range(n_domains)]
+        recs = dict()
+        rec_losses = dict()
+        lat_losses = dict()
+        for i, j in np.argwhere(streams):
+            recs[(i,j)], rec_losses[(i,j)], lat_losses[(i,j)] = self.ae_pipeline(
+                    inputs[i], inputs[j],
+                    head_encs[i], shared_enc, shared_dec, tail_decs[j])
 
-        # dry run as workaround through batchnorm bug
-        dummy = g(z)
-
-        g_ups = []
-        with tf.control_dependencies([
-            tf.assign(self.g_training_phase, False)]):
-            # d loss
-            real_logits = d(xnoise)
-            fake = g(z)
-            fakenoise = kerasify(fake + fake_noise1)
-            fake_logits = d(fakenoise)
-            real_real_ce = tf.losses.sigmoid_cross_entropy(
-                    multi_class_labels = tf.ones_like(real_logits),
-                    logits = real_logits)
-            fake_fake_ce = tf.losses.sigmoid_cross_entropy(
-                    multi_class_labels = tf.zeros_like(fake_logits),
-                    logits = fake_logits)
-            d_loss = 0.5 * (real_real_ce + fake_fake_ce)
-
-            with tf.control_dependencies([
-                tf.assign(self.g_training_phase, True)]):
-                # g loss
-                train_fake = g(z)
-                train_fakenoise = kerasify(train_fake + fake_noise2)
-                train_fake_logits = d(train_fakenoise)
-                fake_fake_ce = tf.losses.sigmoid_cross_entropy(
-                        multi_class_labels = tf.zeros_like(train_fake_logits),
-                        logits = train_fake_logits)
-                fake_real_ce = tf.losses.sigmoid_cross_entropy(
-                        multi_class_labels = tf.ones_like(train_fake_logits),
-                        logits = train_fake_logits)
-                g_loss = 0.5 * (fake_real_ce - fake_fake_ce)
-
-        # g training
-        g_updates = [upd for upd in g.updates if upd.name.startswith("model")] # part of workaround
-        g_trainable_vars = g.trainable_weights
+        # supervised g training
+        g_loss = 0
+        for i,j in np.argwhere(streams):
+            g_loss += rec_losses[(i,j)] + lat_losses[(i,j)]
+        g_loss = g_loss / np.argwhere(streams).shape[0]
+        g_trainable_weights = shared_enc.trainable_weights + shared_dec.trainable_weights
+        for i in range(n_domains):
+            g_trainable_weights += head_encs[i].trainable_weights + tail_decs[i].trainable_weights
         g_optimizer = tf.train.AdamOptimizer(
                 learning_rate = self.lr, beta1 = 0.5, beta2 = 0.9)
-        g_train = [g_optimizer.minimize(g_loss, var_list = g_trainable_vars)] + g_updates
+        g_train = g_optimizer.minimize(g_loss, var_list = g_trainable_weights, global_step = global_step)
 
-        # d training
-        d_trainable_vars = d.trainable_weights
-        d_optimizer = tf.train.AdamOptimizer(
-                learning_rate = self.lr, beta1 = 0.5, beta2 = 0.9)
-        d_train = [d_optimizer.minimize(d_loss, global_step = global_step, var_list = d_trainable_vars)]
+        # visualize latent space (only for active output streams)
+        n_samples = 64
+        samples = dict()
+        for out_stream in np.nonzero(np.any(streams, axis = 0))[0]:
+            samples[out_stream] = self.sample_pipeline(n_samples, shared_dec, tail_decs[out_stream])
 
         # ops
-        self.input_ = input_
-        self.train_ops = {"g_train": g_train, "d_train": d_train}
+        self.inputs = inputs
+        self.train_ops = g_train
         self.log_ops = {
                 "g_loss": g_loss,
-                "d_loss": d_loss,
                 "global_step": global_step}
-        self.img_ops = {
-                "x": x,
-                "xnoise": xnoise,
-                "g": fake,
-                "gnoise": fakenoise}
+        self.img_ops = {}
+        for i in range(n_domains):
+            self.img_ops["input_{}".format(i)] = inputs[i]
+        for i, j in np.argwhere(streams):
+            self.log_ops["rec_loss_{}_{}".format(i,j)] = rec_losses[(i,j)]
+            self.log_ops["lat_loss_{}_{}".format(i,j)] = lat_losses[(i,j)]
+            self.img_ops["rec_{}_{}".format(i,j)] = recs[(i,j)]
+        for i, sample in samples.items():
+            self.img_ops["sample_{}".format(i)] = sample
 
         for k, v in self.log_ops.items():
             tf.summary.scalar(k, v)
@@ -459,14 +319,20 @@ class Model(object):
         self.writer = tf.summary.FileWriter(
                 out_dir,
                 session.graph)
-        session.run(tf.global_variables_initializer())
+        self.saver = tf.train.Saver()
+        if self.restore_path:
+            self.saver.restore(session, restore_path)
+            logging.info("Restored model from {}".format(restore_path))
+        else:
+            session.run(tf.global_variables_initializer())
 
 
-    def fit(self, batches, valid_batches = None):
-        self.valid_batches = valid_batches
+    def fit(self, batches):
         for batch in trange(self.n_total_steps):
             X_batch, Y_batch = next(batches)
-            feed_dict = {self.input_: X_batch, K.learning_phase(): 1}
+            feed_dict = {
+                    self.inputs[0]: X_batch,
+                    self.inputs[1]: Y_batch}
             fetch_dict = {"train": self.train_ops}
             if self.log_ops["global_step"].eval(session) % self.log_frequency == 0:
                 fetch_dict["log"] = self.log_ops
@@ -474,7 +340,6 @@ class Model(object):
                 fetch_dict["summary"] = self.summary_op
             result = session.run(fetch_dict, feed_dict)
             self.log_result(result)
-            #session.run(self.train_ops["g_train"], {K.learning_phase(): 1}) # run generator training twice
 
 
     def log_result(self, result, **kwargs):
@@ -490,23 +355,178 @@ class Model(object):
         if "img" in result:
             for k, v in result["img"].items():
                 plot_images(v, k + "_{:07}".format(global_step))
+        if global_step % self.save_frequency == self.save_frequency - 1:
+            fname = os.path.join(self.checkpoint_dir, "model.ckpt")
+            self.saver.save(
+                    session,
+                    fname,
+                    global_step = global_step)
+            logging.info("Saved model to {}".format(fname))
+
+
+    def ae_pipeline(self, input_, target, head_enc, enc, dec, tail_dec):
+        input_ = kerasify(input_)
+        head_encoding = head_enc(input_)
+
+        enc_encodings = enc(head_encoding)
+        enc_encodings_z, enc_lat_loss = self.ae_sampling(enc_encodings)
+
+        enc_encodings_z = [kerasify(z) for z in enc_encodings_z]
+        decoding = dec(enc_encodings_z)
+        tail_decoding = tail_dec(decoding)
+
+        lat_loss = enc_lat_loss
+        rec_loss = tf.reduce_mean(tf.contrib.layers.flatten(
+            tf.square(target - tail_decoding)))
+
+        return tail_decoding, rec_loss, lat_loss
+
+    
+    def sample_pipeline(self, n_samples, dec, det_dec):
+        zs = []
+        for input_ in dec.inputs:
+            z_shape = (n_samples,) + K.int_shape(input_)[1:]
+            z = tf.random_normal(z_shape, mean = 0.0, stddev = 1.0)
+            z = kerasify(z)
+            zs.append(z)
+        decoding = dec(zs)
+        tail_decoding = det_dec(decoding)
+        return tail_decoding
+
+
+    def ae_sampling(self, encodings):
+        means, vars_ = encodings[:len(encodings)//2], encodings[len(encodings)//2:]
+        kl = 0.0
+        zs = []
+        for mean, var in zip(means, vars_):
+            z_shape = tf.shape(mean)
+            eps = tf.random_normal(z_shape, mean = 0.0, stddev = 1.0)
+            z = mean + tf.sqrt(var) * eps
+            zs.append(z)
+            kl += 0.5 * tf.reduce_mean(tf.contrib.layers.flatten(
+                tf.square(mean) + var - tf.log(var) - 1.0))
+        kl = kl / float(len(means))
+        return zs, kl
+
+
+    def make_enc(self, in_shape, n_features, n_layers):
+        """Stochastic ladder encoder."""
+        # ops
+        conv_op = keras_conv
+        soft_op = lambda x: keras_activate(x, "softplus")
+        norm_op = keras_normalize
+        acti_op = lambda x: keras_activate(x, "leakyrelu")
+
+        # inputs
+        input_ = keras.layers.Input(in_shape)
+        # outputs
+        means = []
+        vars_ = []
+
+        features = input_
+        for i in range(n_layers):
+            mean = conv_op(features, 1, 2**(i+1)*n_features, stride = 1)
+            var_ = conv_op(features, 1, 2**(i+1)*n_features, stride = 1)
+            var_ = soft_op(var_)
+            means.append(mean)
+            vars_.append(var_)
+            if i + 1 < n_layers:
+                features = conv_op(features, 5, 2**i*n_features, stride = 2)
+                features = norm_op(features)
+                features = acti_op(features)
+
+        return keras.models.Model(input_, means + vars_)
+
+
+    def make_dec(self, out_shape, n_features, n_layers):
+        """Stochastic ladder decoder."""
+        # ops
+        conv_op = keras_conv_transposed
+        conc_op = keras_concatenate
+        norm_op = keras_normalize
+        acti_op = lambda x: keras_activate(x, "leakyrelu")
+
+        # inputs
+        inputs = []
+        for l in range(n_layers):
+            in_shape = (
+                    tuple(out_shape[i] // 2**l for i in range(len(out_shape) - 1)) +
+                    (n_features * 2**(l+1),))
+            inputs.append(keras.layers.Input(shape = in_shape))
+
+        # build top down
+        for l in reversed(range(n_layers)):
+            if l == n_layers - 1:
+                features = inputs[l]
+            else:
+                features = conc_op([features, inputs[l]])
+            features = conv_op(features, 5, 2**l*n_features, stride = 2)
+            features = norm_op(features)
+            features = acti_op(features)
+
+        return keras.models.Model(inputs, features)
+
+
+    def make_det_enc(self, in_shape, n_features, n_layers):
+        """Deterministic encoder."""
+        # ops
+        conv_op = keras_conv
+        norm_op = keras_normalize
+        acti_op = lambda x: keras_activate(x, "leakyrelu")
+
+        # inputs
+        input_ = keras.layers.Input(in_shape)
+
+        features = input_
+        for i in range(n_layers):
+            features = conv_op(features, 5, 2**i*n_features, stride = 2)
+            features = norm_op(features)
+            features = acti_op(features)
+
+        return keras.models.Model(input_, features)
+
+
+    def make_det_dec(self, out_shape, n_features, n_layers):
+        """Deterministic decoder. Expects upsampled input."""
+        # ops
+        conv_op = keras_conv_transposed
+        conc_op = keras_concatenate
+        norm_op = keras_normalize
+        acti_op = lambda x: keras_activate(x, "leakyrelu")
+        tanh_op = lambda x: keras_activate(x, "tanh")
+
+        # inputs
+        in_shape = (
+                tuple(out_shape[i] // 2**(n_layers-1) for i in range(len(out_shape) - 1)) +
+                (n_features * 2**n_layers,))
+        input_ = keras.layers.Input(shape = in_shape)
+
+        # build top down
+        features = input_
+        for l in reversed(range(n_layers)):
+            if l > 0:
+                features = conv_op(features, 5, 2**(l-1)*n_features, stride = 2)
+                features = norm_op(features)
+                features = acti_op(features)
+        output = conv_op(features, 5, out_shape[-1], stride = 1)
+        output = tanh_op(output)
+
+        return keras.models.Model(input_, output)
 
 
 if __name__ == "__main__":
-    if grayscale:
-        img_shape = (64, 64, 1)
-    else:
-        img_shape = (64, 64, 3)
+    restore_path = None
+    if len(sys.argv) == 2:
+        restore_path = sys.argv[1]
 
+    img_shape = (64, 64, 3)
     batch_size = 64
 
     init_logging()
-    batches = get_paired_batches("train", img_shape, batch_size)
+    batches = get_batches("train", img_shape, batch_size, ["x", "y"])
     logging.info("Number of training samples: {}".format(batches.n))
-    valid_batches = get_paired_batches("valid", img_shape, batch_size)
-    logging.info("Number of validation samples: {}".format(valid_batches.n))
 
     n_epochs = 100
     n_total_steps = int(n_epochs * batches.n / batch_size)
-    model = Model(img_shape, n_total_steps)
-    model.fit(batches, valid_batches)
+    model = Model(img_shape, n_total_steps, restore_path)
+    model.fit(batches)
