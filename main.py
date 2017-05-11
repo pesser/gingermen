@@ -75,6 +75,8 @@ def get_batches(img_shape, batch_size):
     generator = ImageDataGenerator(preprocessing_function = preprocessing_function)
     hostname = socket.gethostname()
     color_mode = "grayscale" if grayscale else "rgb"
+    # TODO keras uses nearest-neighbor downsampling (via pillow) for
+    # resizing but reference implementation uses bilinear downsampling
     batches = generator.flow_from_directory(
             data_dir,
             target_size = img_shape[:2],
@@ -241,6 +243,8 @@ def keras_subpixel_upsampling(x):
 
 
 def keras_activate(x, method = "relu"):
+    if method == "leakyrelu":
+        method = keras.layers.advanced_activations.LeakyReLU()
     x = keras.layers.Activation(method)(x)
     return x
 
@@ -249,10 +253,53 @@ def keras_concatenate(xs):
     return keras.layers.Concatenate(axis = -1)(xs)
 
 
+kernel_initializer = "glorot_uniform"
+global_kernel_size = 5
+
+
+def keras_dense_to_conv(x, spatial, features):
+    x = keras.layers.Dense(units = spatial*spatial*features,
+            kernel_initializer = kernel_initializer)(x)
+    return keras.layers.Reshape((spatial, spatial, features))(x)
+
+
+def keras_normalize(x, training):
+    l = keras.layers.BatchNormalization(momentum = 0.9, epsilon = 1e-5)
+    n = l(x, training = training)
+    return n
+
+
+def keras_conv(x, filters, stride = 1):
+    return keras.layers.Conv2D(
+            filters = filters,
+            kernel_size = global_kernel_size,
+            strides = stride,
+            padding = "SAME",
+            kernel_initializer = kernel_initializer)(x)
+
+
+def keras_deconv(x, filters):
+    return keras.layers.Conv2DTranspose(
+            filters = filters,
+            kernel_size = global_kernel_size,
+            strides = 2,
+            padding = "SAME",
+            kernel_initializer = kernel_initializer)(x)
+
+
+def keras_to_dense(x, features):
+    x = keras.layers.Flatten()(x)
+    return keras.layers.Dense(units = features, kernel_initializer = kernel_initializer)(x)
+
+
+def kerasify(x):
+    return keras.layers.InputLayer(input_shape = K.int_shape(x)[1:])(x)
+
+
 class Model(object):
     def __init__(self, img_shape, n_total_steps):
         self.img_shape = img_shape
-        self.initial_learning_rate = 1e-2
+        self.lr = 2e-4
         self.end_learning_rate = 0.0
         self.n_total_steps = n_total_steps
         self.begin_latent_weight = 0
@@ -264,285 +311,144 @@ class Model(object):
         self.init_graph()
 
 
-    def make_enc(self):
-        n_features = 16
-        kernel_size = 3
+    def make_dc_gen(self):
+        target_size = self.img_shape[0]
+        n_upsamplings = 4
+        coarsest_size = target_size // (2**n_upsamplings)
+        n_features = 64
+        training = self.g_training_phase
 
-        conv_op = keras_cnconv
-        activation_op = lambda x: keras_activate(x, "elu")
+        z = keras.layers.Input((self.latent_dim,))
 
-        input_ = keras.layers.Input(shape = self.img_shape)
-        features = input_
-        features = conv_op(features, kernel_size, 2**0*n_features, stride = 2)
-        features = conv_op(features, kernel_size, 2**1*n_features)
-        output = features
-        self.enc_output_shape = K.int_shape(output)[1:]
+        features = z
+        features = keras_dense_to_conv(
+                features,
+                spatial = coarsest_size,
+                features = 2**(n_upsamplings - 1) * n_features)
+        features = keras_normalize(features, training)
+        features = keras_activate(features, "relu")
+        for i in range(n_upsamplings - 1):
+            nf = 2**(n_upsamplings - 2 - i) * n_features
+            features = keras_deconv(features, nf)
+            features = keras_normalize(features, training)
+            features = keras_activate(features, "relu")
+        g = keras_deconv(features, 3)
+        g = keras_activate(g, "tanh")
 
-        return keras.models.Model(input_, output)
-
-
-    def make_ladder_enc(self):
-        n_features = self.enc_output_shape[-1]
-        kernel_size = 3
-        self.n_downsamplings = n_downsamplings = 4
-
-        conv_op = keras_cnconv
-        activation_op = lambda x: keras_activate(x, "elu")
-
-        means = []
-        vars_ = []
-        self.z_shapes = []
-
-        input_ = keras.layers.Input(shape = self.enc_output_shape)
-        features = input_
-        for i in range(n_downsamplings):
-            features = conv_op(features, kernel_size, 2**i*n_features, stride = 2)
-            features = activation_op(features)
-            mean = conv_op(features, 1, 2**(i+1)*n_features)
-            var = conv_op(features, 1, 2**(i+1)*n_features)
-            var = keras_activate(var, "softplus")
-            means.append(mean)
-            vars_.append(var)
-            self.z_shapes.append(K.int_shape(mean)[1:])
-
-        return keras.models.Model(input_, means + vars_)
+        return keras.models.Model(z, g)
 
 
-    def make_ladder_dec(self):
-        n_features = self.enc_output_shape[-1]
-        kernel_size = 3
-        n_upsamplings = self.n_downsamplings
+    def make_dc_dis(self):
+        n_downsamplings = 4
+        n_features = 64
+        training = 0
 
-        concat_op = keras_concatenate
-        conv_op = keras_cnconv
-        activation_op = lambda x: keras_activate(x, "elu")
+        # inputs
+        x = keras.layers.Input(self.img_shape)
 
-        inputs = []
-        for z_shape in self.z_shapes:
-            inputs.append(keras.layers.Input(shape = z_shape))
+        features = x
+        features = keras_conv(features, n_features, stride = 2)
+        features = keras_activate(features, "leakyrelu")
+        for i in range(1, n_downsamplings):
+            features = keras_conv(features, n_features * 2**i, stride = 2)
+            features = keras_normalize(features, training)
+            features = keras_activate(features, "leakyrelu")
+        logit = keras_to_dense(features, 1)
 
-        for i in reversed(range(n_upsamplings)):
-            dec_layer = n_upsamplings - 1 - i
-            if dec_layer == 0:
-                logging.info("Ladder decoder input shape: {}".format(K.int_shape(inputs[-(1 + dec_layer)])))
-                features = inputs[-(1 + dec_layer)]
-            else: # concatenate ladder connections
-                logging.info("Ladder decoder input shape: {}".format(K.int_shape(inputs[-(1 + dec_layer)])))
-                features = concat_op([features, inputs[-(1 + dec_layer)]])
+        return keras.models.Model(x, logit)
 
-            features = conv_op(features, kernel_size, 2**i*n_features*2*2)
-            features = keras_subpixel_upsampling(features)
-            features = activation_op(features)
-        output = features
-        self.ladder_dec_output_shape = K.int_shape(output)[1:]
-
-        return keras.models.Model(inputs, output)
-
-
-    def make_dec(self):
-        n_out_channels = self.img_shape[-1]
-        n_features = self.enc_output_shape[-1]
-        kernel_size = 3
-
-        conv_op = keras_cnconv
-        activation_op = lambda x: keras_activate(x, "elu")
-
-        input_ = keras.layers.Input(shape = self.ladder_dec_output_shape)
-        features = input_
-        features = conv_op(features, kernel_size, 2**1*n_features)
-        features = conv_op(features, kernel_size, n_out_channels*2*2)
-        features = keras_subpixel_upsampling(features)
-        output = features
-
-        return keras.models.Model(input_, output)
-
-
-    def make_discriminator(self):
-        n_downsamplings = 6
-        n_features = 32
-        kernel_size = 3
-
-        conv_op = keras_cnconv
-        activation_op = lambda x: keras_activate(x, "elu")
-        global_avg_op = lambda x: keras.layers.pooling.GlobalAveragePooling2D()(x)
-
-        input_ = keras.layers.Input(shape = self.img_shape)
-        features = input_
-        for i in range(n_downsamplings):
-            features = conv_op(features, kernel_size, 2**i*n_features, stride = 2)
-            features = activation_op(features)
-        features = conv_op(features, 1, 1)
-        logits = global_avg_op(features)
-
-        return keras.models.Model(input_, logits)
 
 
     def define_graph(self):
+        self.latent_dim = 100
+
         self.train_ops = {}
         self.log_ops = {}
         self.img_ops = {}
 
-        self.n_domains = n_domains = 2
         global_step = tf.Variable(0, trainable = False)
+        # variables to switch batch normalization behaviour of the models
+        self.g_training_phase = tf.Variable(False, trainable = False, dtype = tf.bool)
 
-        # generator
-        encs = [self.make_enc() for i in range(n_domains)]
-        ladder_enc = self.make_ladder_enc()
-        ladder_dec = self.make_ladder_dec()
-        decs = [self.make_dec() for i in range(n_domains)]
+        g = self.make_dc_gen()
+        d = self.make_dc_dis()
 
-        ladder_enc.summary()
-        ladder_dec.summary()
-        for i in range(n_domains):
-            encs[i].summary()
-            decs[i].summary()
+        input_ = tf.placeholder(tf.float32, shape = (None,) + self.img_shape)
+        #batch_size = 64
+        batch_size = tf.shape(input_)[0]
+        z = tf.random_uniform((batch_size, self.latent_dim), minval = -1.0, maxval = 1.0)
 
-        # split output of ladder encoder into mean and variances
-        def split_output(l):
-            return l[:len(l)//2], l[len(l)//2:]
-
-        inputs = [tf.placeholder(tf.float32, shape = (None,) + self.img_shape) for i in range(n_domains)]
-
-        # generator tensor flow
-        latent_vars = []
-        decodings = []
-        for i in range(n_domains):
-            # encode
-            encoding = encs[i](inputs[i])
-
-            # sample from encoder distribution
-            outputs = ladder_enc(encoding)
-            means, vars_ = split_output(outputs)
-            latent_vars.append((means, vars_))
-            zs = []
-            for mean, var in zip(means, vars_):
-                z_shape = tf.shape(mean)
-                eps = tf.random_normal(z_shape, mean = 0.0, stddev = 1.0)
-                z = mean + tf.sqrt(var) * eps
-                zs.append(z)
-
-            # decode
-            ladder_decoding = ladder_dec(zs)
-            decodings.append([decs[j](ladder_decoding) for j in range(n_domains)])
-
-        # sampled latent space according to prior to produce samples
-        batch_size = tf.shape(inputs[0])[0]
-        noises = []
-        for z_shape in self.z_shapes:
-            noises.append(tf.random_normal((batch_size,) + z_shape, mean = 0.0, stddev = 1.0))
-        ladder_decoding = ladder_dec(noises)
-        gs = [decs[j](ladder_decoding) for j in range(n_domains)]
-
-        # prior on latent space - kl distance to standard normal
-        loss_latent = 0.0
-        for means, vars_ in latent_vars:
-            for mean, var in zip(means, vars_):
-                loss_latent += 0.5 * tf.reduce_mean(tf.contrib.layers.flatten(
-                    tf.square(mean) + var - tf.log(var) - 1.0)) / float(len(means)) / float(len(latent_vars))
-
-        # likelihood - reconstruction loss
-        loss_reconstruction = 0.0
-        for i in range(n_domains):
-            for j in range(n_domains):
-                loss_reconstruction += tf.reduce_mean(tf.contrib.layers.flatten(
-                    tf.square(inputs[i] - decodings[j][i]))) / float(n_domains*n_domains)
-
-        # increasing weight for latent loss
+        # linear from (a, alpha) to (b, beta)
         # (beta - alpha)/(b - a) * (x - a) + alpha
-        loss_latent_weight = tf.maximum(0.0,
-                (self.final_latent_weight - 0.0) /
-                (self.n_total_steps - self.begin_latent_weight) *
-                (tf.cast(global_step, tf.float32) - self.begin_latent_weight) + 0.0)
-        loss = loss_latent_weight * loss_latent + loss_reconstruction
+        noise_level = tf.maximum(0.0,
+                (0.0 - 1.0) /
+                (self.n_total_steps - 0) *
+                (tf.cast(global_step, tf.float32) - 0) + 1.0)
+        input_noise = tf.random_normal(tf.shape(input_), mean = 0.0, stddev = noise_level)
+        fake_noise1 = tf.random_normal(tf.shape(input_), mean = 0.0, stddev = noise_level)
+        fake_noise2 = tf.random_normal(tf.shape(input_), mean = 0.0, stddev = noise_level)
 
-        # discriminator
-        # only first domain
-        n_domains = 1
-        discriminators = [self.make_discriminator() for i in range(n_domains)]
-        real_logits = [discriminators[i](inputs[i]) for i in range(n_domains)]
-        fake_logits = [discriminators[i](gs[i]) for i in range(n_domains)]
-        real_real_entropies = [
-                tf.losses.sigmoid_cross_entropy(
-                    multi_class_labels = tf.ones_like(real_logits[i]),
-                    logits = real_logits[i]) for i in range(n_domains)]
-        real_real_entropy = tf.add_n(real_real_entropies) / n_domains
-        fake_fake_entropies = [
-                tf.losses.sigmoid_cross_entropy(
-                    multi_class_labels = tf.zeros_like(fake_logits[i]),
-                    logits = fake_logits[i]) for i in range(n_domains)]
-        fake_fake_entropy = tf.add_n(fake_fake_entropies) / n_domains
-        fake_real_entropies = [
-                tf.losses.sigmoid_cross_entropy(
-                    multi_class_labels = tf.ones_like(fake_logits[i]),
-                    logits = fake_logits[i]) for i in range(n_domains)]
-        fake_real_entropy = tf.add_n(fake_real_entropies) / n_domains
-        d_loss = real_real_entropy + fake_fake_entropy
+        x = kerasify(input_)
+        xnoise = kerasify(x + input_noise)
 
-        # increasing weight for discriminative loss of generator
-        # (beta - alpha)/(b - a) * (x - a) + alpha
-        loss_discrimination_weight = tf.maximum(0.0,
-                (self.final_discrimination - 0.0) /
-                (self.n_total_steps - self.begin_discrimination) *
-                (tf.cast(global_step, tf.float32) - self.begin_discrimination) + 0.0)
-        loss += loss_discrimination_weight * fake_real_entropy
-        n_domains = 2
+        # dry run as workaround through batchnorm bug
+        dummy = g(z)
+
+        g_ups = []
+        with tf.control_dependencies([
+            tf.assign(self.g_training_phase, False)]):
+            # d loss
+            real_logits = d(xnoise)
+            fake = g(z)
+            fakenoise = kerasify(fake + fake_noise1)
+            fake_logits = d(fakenoise)
+            real_real_ce = tf.losses.sigmoid_cross_entropy(
+                    multi_class_labels = tf.ones_like(real_logits),
+                    logits = real_logits)
+            fake_fake_ce = tf.losses.sigmoid_cross_entropy(
+                    multi_class_labels = tf.zeros_like(fake_logits),
+                    logits = fake_logits)
+            d_loss = 0.5 * (real_real_ce + fake_fake_ce)
+
+            with tf.control_dependencies([
+                tf.assign(self.g_training_phase, True)]):
+                # g loss
+                train_fake = g(z)
+                train_fakenoise = kerasify(train_fake + fake_noise2)
+                train_fake_logits = d(train_fakenoise)
+                fake_fake_ce = tf.losses.sigmoid_cross_entropy(
+                        multi_class_labels = tf.zeros_like(train_fake_logits),
+                        logits = train_fake_logits)
+                fake_real_ce = tf.losses.sigmoid_cross_entropy(
+                        multi_class_labels = tf.ones_like(train_fake_logits),
+                        logits = train_fake_logits)
+                g_loss = 0.5 * (fake_real_ce - fake_fake_ce)
 
         # g training
-        trainable_vars = ladder_enc.trainable_weights + ladder_dec.trainable_weights
-        for i in range(n_domains):
-            trainable_vars += encs[i].trainable_weights + decs[i].trainable_weights
-        logging.debug("Generator trainable vars: {}".format(len(trainable_vars)))
-        learning_rate = tf.train.polynomial_decay(
-                learning_rate = self.initial_learning_rate,
-                global_step = global_step,
-                decay_steps = self.n_total_steps,
-                end_learning_rate = self.end_learning_rate,
-                power = 1.0)
-        optimizer = tf.train.AdamOptimizer(
-                learning_rate = learning_rate, beta1 = 0.5, beta2 = 0.9)
-        train = optimizer.minimize(loss, global_step = global_step, var_list = trainable_vars)
+        g_updates = [upd for upd in g.updates if upd.name.startswith("model")] # part of workaround
+        g_trainable_vars = g.trainable_weights
+        g_optimizer = tf.train.AdamOptimizer(
+                learning_rate = self.lr, beta1 = 0.5, beta2 = 0.9)
+        g_train = [g_optimizer.minimize(g_loss, var_list = g_trainable_vars)] + g_updates
 
         # d training
-        n_domains = 1
-        d_trainable_vars = []
-        for i in range(n_domains):
-            d_trainable_vars += discriminators[i].trainable_weights
-        logging.debug("Discriminator trainable vars: {}".format(len(d_trainable_vars)))
-        d_learning_rate = tf.train.polynomial_decay(
-                learning_rate = 1e-3,
-                global_step = global_step,
-                decay_steps = self.n_total_steps,
-                end_learning_rate = self.end_learning_rate,
-                power = 1.0)
+        d_trainable_vars = d.trainable_weights
         d_optimizer = tf.train.AdamOptimizer(
-                learning_rate = d_learning_rate, beta1 = 0.5, beta2 = 0.9)
-        d_train = d_optimizer.minimize(d_loss, var_list = d_trainable_vars)
-        n_domains = 2
+                learning_rate = self.lr, beta1 = 0.5, beta2 = 0.9)
+        d_train = [d_optimizer.minimize(d_loss, global_step = global_step, var_list = d_trainable_vars)]
 
         # ops
-        self.inputs = dict((i, inputs[i]) for i in range(n_domains))
-        self.train_ops = {"train": train, "d_train": d_train}
+        self.input_ = input_
+        self.train_ops = {"g_train": g_train, "d_train": d_train}
         self.log_ops = {
-                "loss": loss,
-                "loss_latent": loss_latent,
-                "loss_reconstruction": loss_reconstruction,
-
+                "g_loss": g_loss,
                 "d_loss": d_loss,
-                "real_real_entropy": real_real_entropy,
-                "fake_fake_entropy": fake_fake_entropy,
-                "fake_real_entropy": fake_real_entropy,
-
-                "global_step": global_step,
-                "learning_rate": learning_rate,
-                "d_learning_rate": d_learning_rate,
-                "loss_latent_weight": loss_latent_weight,
-                "loss_discrimination_weight": loss_discrimination_weight}
-                #"discrimination_weight": discrimination_weight}
-        self.img_ops = dict(
-                ("{}{}".format(i,j), decodings[i][j])
-                for i, j in itertools.product(range(n_domains), range(n_domains)))
-        self.img_ops.update(dict(
-            ("g{}".format(j), gs[j]) for j in range(n_domains)))
+                "global_step": global_step}
+        self.img_ops = {
+                "x": x,
+                "xnoise": xnoise,
+                "g": fake,
+                "gnoise": fakenoise}
 
         for k, v in self.log_ops.items():
             tf.summary.scalar(k, v)
@@ -560,17 +466,15 @@ class Model(object):
         self.valid_batches = valid_batches
         for batch in trange(self.n_total_steps):
             X_batch, Y_batch = next(batches)
-            feed_dict = {
-                    self.inputs[0]: X_batch,
-                    self.inputs[1]: Y_batch}
+            feed_dict = {self.input_: X_batch, K.learning_phase(): 1}
             fetch_dict = {"train": self.train_ops}
-            kwargs = {}
             if self.log_ops["global_step"].eval(session) % self.log_frequency == 0:
                 fetch_dict["log"] = self.log_ops
                 fetch_dict["img"] = self.img_ops
                 fetch_dict["summary"] = self.summary_op
-            result = session.run(fetch_dict, feed_dict, **kwargs)
-            self.log_result(result, **kwargs)
+            result = session.run(fetch_dict, feed_dict)
+            self.log_result(result)
+            #session.run(self.train_ops["g_train"], {K.learning_phase(): 1}) # run generator training twice
 
 
     def log_result(self, result, **kwargs):
@@ -586,33 +490,6 @@ class Model(object):
         if "img" in result:
             for k, v in result["img"].items():
                 plot_images(v, k + "_{:07}".format(global_step))
-            self.validate()
-
-
-    def validate(self):
-        if self.valid_batches is not None:
-            global_step = self.log_ops["global_step"].eval(session)
-            seen_batches = 0
-            losses = []
-            #while seen_batches < self.valid_batches.n:
-            # just use a single batch of validation data to speed things up
-            for i in range(1):
-                X_batch, Y_batch = next(self.valid_batches)
-                seen_batches += X_batch.shape[0]
-                feed_dict = {
-                        self.inputs[0]: X_batch,
-                        self.inputs[1]: Y_batch}
-                fetch_dict = {
-                        "log": self.log_ops,
-                        "img": self.img_ops}
-                result = session.run(fetch_dict, feed_dict)
-                losses.append(result["log"]["loss"])
-            # plot last batch of images
-            for k, v in result["img"].items():
-                plot_images(v, "valid_" + k + "_{:07}".format(global_step))
-            # log average loss
-            loss = np.mean(losses)
-            logging.info("{}: {:.4e}".format("validation loss", loss))
 
 
 if __name__ == "__main__":
