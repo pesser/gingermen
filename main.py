@@ -205,6 +205,10 @@ def keras_conv_transposed(x, kernel_size, filters, stride = 1):
             kernel_initializer = kernel_initializer)(x)
 
 
+def keras_global_avg(x):
+    return keras.layers.GlobalAveragePooling2D()(x)
+
+
 def keras_to_dense(x, features):
     x = keras.layers.Flatten()(x)
     return keras.layers.Dense(units = features, kernel_initializer = kernel_initializer)(x)
@@ -258,6 +262,7 @@ class Model(object):
         streams = np.zeros((n_domains, n_domains), dtype = np.bool)
         streams[0,0] = True
         streams[1,0] = True
+        output_streams = np.nonzero(np.any(streams, axis = 0))[0]
 
         # encoder-decoder pipeline
         head_encs = [self.make_det_enc(self.img_shape, n_features = 64, n_layers = 2) for i in range(n_domains)]
@@ -281,6 +286,37 @@ class Model(object):
         for i,j in np.argwhere(streams):
             g_loss += rec_losses[(i,j)] + lat_losses[(i,j)]
         g_loss = g_loss / np.argwhere(streams).shape[0]
+
+        # visualize latent space (only for active output streams)
+        n_samples = 64
+        samples = dict()
+        for out_stream in output_streams:
+            samples[out_stream] = self.sample_pipeline(n_samples, shared_dec, tail_decs[out_stream])
+
+        # adversarial training
+        # label for each translation stream and one for each original domain
+        label_map = dict()
+        for label, (i, j) in enumerate(np.argwhere(streams)):
+            label_map[(i,j)] = label
+        real_labels_start = label
+        for i in range(n_domains):
+            label_map[i] = real_labels_start + label
+        n_labels = len(label_map)
+        disc = self.make_discriminator(self.img_shape, n_features = 64, n_layers = 5, n_labels = n_labels)
+
+        # adversarial loss for g
+        g_train_logits = dict()
+        g_train_ces = dict()
+        for i, j in np.argwhere(streams):
+            g_train_logits[(i,j)] = disc(recs[(i,j)])
+            bs = (tf.shape(g_train_logits[(i,j)])[0],)
+            target_label = label_map[j]
+            g_train_ces[(i,j)] = tf.losses.sparse_softmax_cross_entropy(
+                    labels = target_label * tf.ones(bs, dtype = tf.int32),
+                    logits = g_train_logits[(i,j)])
+            g_loss += g_train_ces[(i,j)] / np.argwhere(streams).shape[0]
+
+        # generator training
         g_trainable_weights = shared_enc.trainable_weights + shared_dec.trainable_weights
         for i in range(n_domains):
             g_trainable_weights += head_encs[i].trainable_weights + tail_decs[i].trainable_weights
@@ -288,17 +324,56 @@ class Model(object):
                 learning_rate = self.lr, beta1 = 0.5, beta2 = 0.9)
         g_train = g_optimizer.minimize(g_loss, var_list = g_trainable_weights, global_step = global_step)
 
-        # visualize latent space (only for active output streams)
-        n_samples = 64
-        samples = dict()
-        for out_stream in np.nonzero(np.any(streams, axis = 0))[0]:
-            samples[out_stream] = self.sample_pipeline(n_samples, shared_dec, tail_decs[out_stream])
+        # positive discriminator samples
+        d_train_pos_inputs = [tf.placeholder(tf.float32, shape = (None,) + self.img_shape) for i in range(n_domains)]
+        d_train_real_logits = dict()
+        d_train_real_ces = dict()
+        d_loss = 0.0
+        for i in output_streams:
+            d_train_real_logits[i] = disc(kerasify(d_train_pos_inputs[i]))
+            bs = (tf.shape(d_train_real_logits[i])[0],)
+            target_label = label_map[i]
+            d_train_real_ces[i] = tf.losses.sparse_softmax_cross_entropy(
+                    labels = target_label * tf.ones(bs, dtype = tf.int32),
+                    logits = d_train_real_logits[i])
+            d_loss += d_train_real_ces[i] / len(output_streams)
+
+        # negative discriminator samples
+        # need new independent samples to produce fake images as negative
+        # samples - could be good to have domain samples independent too
+        d_train_neg_inputs = [tf.placeholder(tf.float32, shape = (None,) + self.img_shape) for i in range(n_domains)]
+        d_train_recs = dict()
+        d_train_fake_logits = dict()
+        d_train_fake_ces = dict()
+        for i, j in np.argwhere(streams):
+            d_train_recs[(i,j)], _, _ = self.ae_pipeline(
+                    d_train_neg_inputs[i], d_train_neg_inputs[j],
+                    head_encs[i], shared_enc, shared_dec, tail_decs[j])
+            d_train_fake_logits[(i,j)] = disc(d_train_recs[(i,j)])
+            bs = (tf.shape(d_train_fake_logits[(i,j)])[0],)
+            target_label = label_map[(i,j)]
+            d_train_fake_ces[(i,j)] = tf.losses.sparse_softmax_cross_entropy(
+                    labels = target_label * tf.ones(bs, dtype = tf.int32),
+                    logits = d_train_fake_logits[(i,j)])
+            d_loss += d_train_fake_ces[(i,j)] / np.argwhere(streams).shape[0]
+
+        # discriminator training
+        d_trainable_weights = disc.trainable_weights
+        d_optimizer = tf.train.AdamOptimizer(
+                learning_rate = self.lr, beta1 = 0.5, beta2 = 0.9)
+        d_train = d_optimizer.minimize(d_loss, var_list = d_trainable_weights)
 
         # ops
-        self.inputs = inputs
-        self.train_ops = g_train
+        self.inputs = {
+                "g": inputs,
+                "d_positive": d_train_pos_inputs,
+                "d_negative": d_train_neg_inputs}
+        self.train_ops = {
+                "g": g_train,
+                "d": d_train}
         self.log_ops = {
                 "g_loss": g_loss,
+                "d_loss": d_loss,
                 "global_step": global_step}
         self.img_ops = {}
         for i in range(n_domains):
@@ -321,7 +396,22 @@ class Model(object):
                 session.graph)
         self.saver = tf.train.Saver()
         if self.restore_path:
-            self.saver.restore(session, restore_path)
+            restore_without_d = True
+            if restore_without_d:
+                # discriminator was added later on but I wanted to start from
+                # the model pretrained without it. Restore weights of
+                # pretrained model and initialize the rest
+                # just initialize all
+                session.run(tf.global_variables_initializer())
+                # and now restore what's available
+                checkpoint_vars = [v[0] for v in tf.contrib.framework.list_variables(self.restore_path)]
+                print(checkpoint_vars)
+                varmap = dict((name, tf.get_variable(name)) for name in checkpoint_vars if name != "Variable")
+                restorer = tf.train.Saver(checkpoint_vars)
+                restorer.restore(session, restore_path)
+            else:
+                # checkpoint should match current model
+                self.saver.restore(session, restore_path)
             logging.info("Restored model from {}".format(restore_path))
         else:
             session.run(tf.global_variables_initializer())
@@ -331,9 +421,18 @@ class Model(object):
         self.valid_batches = valid_batches
         for batch in trange(self.n_total_steps):
             X_batch, Y_batch = next(batches)
+            X1_batch, Y1_batch = next(batches)
+            X2_batch, Y2_batch = next(batches)
+            # cross over to avoid correlation during discriminator training
+            X_pos_batch, Y_pos_batch = X1_batch, Y2_batch
+            X_neg_batch, Y_neg_batch = X2_batch, Y1_batch
             feed_dict = {
-                    self.inputs[0]: X_batch,
-                    self.inputs[1]: Y_batch}
+                    self.inputs["g"][0]: X_batch,
+                    self.inputs["g"][1]: Y_batch,
+                    self.inputs["d_positive"][0]: X_pos_batch,
+                    self.inputs["d_positive"][1]: Y_pos_batch,
+                    self.inputs["d_negative"][0]: X_neg_batch,
+                    self.inputs["d_negative"][1]: Y_neg_batch}
             fetch_dict = {"train": self.train_ops}
             if self.log_ops["global_step"].eval(session) % self.log_frequency == 0:
                 fetch_dict["log"] = self.log_ops
@@ -358,10 +457,10 @@ class Model(object):
                 plot_images(v, k + "_{:07}".format(global_step))
             if self.valid_batches is not None:
                 # validation samples
-                X_batch, Y_batch = next(self.valid_batches)
+                batch = next(self.valid_batches)
                 feed_dict = {
-                        self.inputs[0]: X_batch,
-                        self.inputs[1]: Y_batch}
+                        self.inputs["g"][0]: batch[0],
+                        self.inputs["g"][1]: batch[1]}
                 imgs = session.run(self.img_ops, feed_dict)
                 for k, v in imgs.items():
                     plot_images(v, "valid_" + k + "_{:07}".format(global_step))
@@ -522,6 +621,28 @@ class Model(object):
         output = tanh_op(output)
 
         return keras.models.Model(input_, output)
+
+
+    def make_discriminator(self, in_shape, n_features, n_layers, n_labels):
+        """Deterministic discriminator."""
+        # ops
+        conv_op = keras_conv
+        norm_op = keras_normalize
+        acti_op = lambda x: keras_activate(x, "leakyrelu")
+        gavg_op = keras_global_avg
+
+        # inputs
+        input_ = keras.layers.Input(in_shape)
+
+        features = input_
+        for i in range(n_layers):
+            features = conv_op(features, 5, 2**i*n_features, stride = 2)
+            features = norm_op(features)
+            features = acti_op(features)
+        features = conv_op(features, 5, n_labels, stride = 2)
+        logits = gavg_op(features)
+
+        return keras.models.Model(input_, logits)
 
 
 if __name__ == "__main__":
