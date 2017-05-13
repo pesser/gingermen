@@ -305,6 +305,7 @@ class Model(object):
         disc = self.make_discriminator(self.img_shape, n_features = 64, n_layers = 5, n_labels = n_labels)
 
         # adversarial loss for g
+        g_adversarial_weight = 0.01
         g_train_logits = dict()
         g_train_ces = dict()
         for i, j in np.argwhere(streams):
@@ -314,7 +315,7 @@ class Model(object):
             g_train_ces[(i,j)] = tf.losses.sparse_softmax_cross_entropy(
                     labels = target_label * tf.ones(bs, dtype = tf.int32),
                     logits = g_train_logits[(i,j)])
-            g_loss += g_train_ces[(i,j)] / np.argwhere(streams).shape[0]
+            g_loss += g_adversarial_weight * g_train_ces[(i,j)] / np.argwhere(streams).shape[0]
 
         # generator training
         g_trainable_weights = shared_enc.trainable_weights + shared_dec.trainable_weights
@@ -396,7 +397,7 @@ class Model(object):
                 session.graph)
         self.saver = tf.train.Saver()
         if self.restore_path:
-            restore_without_d = True
+            restore_without_d = False
             if restore_without_d:
                 # discriminator was added later on but I wanted to start from
                 # the model pretrained without it. Restore weights of
@@ -473,7 +474,7 @@ class Model(object):
             logging.info("Saved model to {}".format(fname))
 
 
-    def ae_pipeline(self, input_, target, head_enc, enc, dec, tail_dec):
+    def ae_pipeline(self, input_, target, head_enc, enc, dec, tail_dec, loss = "l1"):
         input_ = kerasify(input_)
         head_encoding = head_enc(input_)
 
@@ -485,8 +486,14 @@ class Model(object):
         tail_decoding = tail_dec(decoding)
 
         lat_loss = enc_lat_loss
-        rec_loss = tf.reduce_mean(tf.contrib.layers.flatten(
-            tf.square(target - tail_decoding)))
+        if loss == "l2":
+            rec_loss = tf.reduce_mean(tf.contrib.layers.flatten(
+                tf.square(target - tail_decoding)))
+        elif loss == "l1":
+            rec_loss = tf.reduce_mean(tf.contrib.layers.flatten(
+                tf.abs(target - tail_decoding)))
+        else:
+            raise NotImplemented("Unknown loss function: {}".format(loss))
 
         return tail_decoding, rec_loss, lat_loss
 
