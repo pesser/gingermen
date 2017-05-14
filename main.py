@@ -218,7 +218,7 @@ def kerasify(x):
     return keras.layers.InputLayer(input_shape = K.int_shape(x)[1:])(x)
 
 
-def make_linear_var(self,
+def make_linear_var(
         step,
         start, end,
         start_value, end_value,
@@ -230,6 +230,10 @@ def make_linear_var(self,
             (end - start) *
             (tf.cast(step, tf.float32) - start) + start_value)
     return tf.clip_by_value(linear, clip_min, clip_max)
+
+
+def tf_corrupt(x, eps):
+    return x + eps * tf.random_normal(tf.shape(x), mean = 0.0, stddev = 1.0)
 
 
 class Model(object):
@@ -253,7 +257,8 @@ class Model(object):
         self.log_ops = {}
         self.img_ops = {}
 
-        global_step = tf.Variable(0, trainable = False)
+        global_step = tf.Variable(0, trainable = False, name = "global_step")
+        noise_level = tf.Variable(1.0, trainable = False, dtype = tf.float32, name = "noise_level")
 
         n_domains = 2
 
@@ -308,14 +313,18 @@ class Model(object):
         g_adversarial_weight = 0.01
         g_train_logits = dict()
         g_train_ces = dict()
+        g_loss_adversarial = 0.0
         for i, j in np.argwhere(streams):
-            g_train_logits[(i,j)] = disc(recs[(i,j)])
+            disc_input = kerasify(tf_corrupt(recs[(i,j)], noise_level))
+            g_train_logits[(i,j)] = disc(disc_input)
             bs = (tf.shape(g_train_logits[(i,j)])[0],)
             target_label = label_map[j]
             g_train_ces[(i,j)] = tf.losses.sparse_softmax_cross_entropy(
                     labels = target_label * tf.ones(bs, dtype = tf.int32),
                     logits = g_train_logits[(i,j)])
-            g_loss += g_adversarial_weight * g_train_ces[(i,j)] / np.argwhere(streams).shape[0]
+            g_loss_adversarial += g_train_ces[(i,j)]
+        g_loss_adversarial = g_loss_adversarial / np.argwhere(streams).shape[0]
+        g_loss += g_adversarial_weight * g_loss_adversarial
 
         # generator training
         g_trainable_weights = shared_enc.trainable_weights + shared_dec.trainable_weights
@@ -331,7 +340,8 @@ class Model(object):
         d_train_real_ces = dict()
         d_loss = 0.0
         for i in output_streams:
-            d_train_real_logits[i] = disc(kerasify(d_train_pos_inputs[i]))
+            disc_input = kerasify(tf_corrupt(d_train_pos_inputs[i], noise_level))
+            d_train_real_logits[i] = disc(disc_input)
             bs = (tf.shape(d_train_real_logits[i])[0],)
             target_label = label_map[i]
             d_train_real_ces[i] = tf.losses.sparse_softmax_cross_entropy(
@@ -350,7 +360,8 @@ class Model(object):
             d_train_recs[(i,j)], _, _ = self.ae_pipeline(
                     d_train_neg_inputs[i], d_train_neg_inputs[j],
                     head_encs[i], shared_enc, shared_dec, tail_decs[j])
-            d_train_fake_logits[(i,j)] = disc(d_train_recs[(i,j)])
+            disc_input = kerasify(tf_corrupt(d_train_recs[(i,j)], noise_level))
+            d_train_fake_logits[(i,j)] = disc(disc_input)
             bs = (tf.shape(d_train_fake_logits[(i,j)])[0],)
             target_label = label_map[(i,j)]
             d_train_fake_ces[(i,j)] = tf.losses.sparse_softmax_cross_entropy(
@@ -364,6 +375,14 @@ class Model(object):
                 learning_rate = self.lr, beta1 = 0.5, beta2 = 0.9)
         d_train = d_optimizer.minimize(d_loss, var_list = d_trainable_weights)
 
+        # noise level training
+        # ratio of loss(discriminator) / loss(generator)
+        target_ratio = 4 / 5
+        noise_control = target_ratio * g_loss_adversarial - d_loss
+        update_noise_level = tf.assign(
+                noise_level,
+                tf.clip_by_value(noise_level + 1e-3 * noise_control, 0, 1))
+
         # ops
         self.inputs = {
                 "g": inputs,
@@ -371,10 +390,14 @@ class Model(object):
                 "d_negative": d_train_neg_inputs}
         self.train_ops = {
                 "g": g_train,
-                "d": d_train}
+                "d": d_train,
+                "noise": update_noise_level}
         self.log_ops = {
                 "g_loss": g_loss,
+                "g_loss_adversarial": g_loss_adversarial,
                 "d_loss": d_loss,
+                "noise_control": noise_control,
+                "noise_level": noise_level,
                 "global_step": global_step}
         self.img_ops = {}
         for i in range(n_domains):
