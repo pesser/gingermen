@@ -168,9 +168,11 @@ def keras_subpixel_upsampling(x):
 
 def keras_activate(x, method = "relu"):
     if method == "leakyrelu":
-        method = keras.layers.advanced_activations.LeakyReLU()
-    x = keras.layers.Activation(method)(x)
-    return x
+        x = keras.layers.advanced_activations.LeakyReLU()(x)
+        return x
+    else:
+        x = keras.layers.Activation(method)(x)
+        return x
 
 
 def keras_concatenate(xs):
@@ -267,6 +269,7 @@ class Model(object):
         streams = np.zeros((n_domains, n_domains), dtype = np.bool)
         streams[0,0] = True
         streams[1,0] = True
+        cross_streams = streams & (~np.eye(n_domains, dtype = np.bool))
         output_streams = np.nonzero(np.any(streams, axis = 0))[0]
 
         # encoder-decoder pipeline
@@ -299,13 +302,12 @@ class Model(object):
             samples[out_stream] = self.sample_pipeline(n_samples, shared_dec, tail_decs[out_stream])
 
         # adversarial training
-        # label for each translation stream and one for each original domain
-        label_map = dict()
-        for label, (i, j) in enumerate(np.argwhere(streams)):
-            label_map[(i,j)] = label
-        real_labels_start = label
-        for i in range(n_domains):
-            label_map[i] = real_labels_start + label
+        # label for each cross translation stream whether this is a real pair or
+        # fake pair
+        label_map = {"real": dict(), "fake": dict()}
+        for label, (i, j) in enumerate(np.argwhere(cross_streams)):
+            label_map["real"][(i,j)] = label * 2 + 0
+            label_map["fake"][(i,j)] = label * 2 + 1
         n_labels = len(label_map)
         disc = self.make_discriminator(self.img_shape, n_features = 64, n_layers = 5, n_labels = n_labels)
 
@@ -314,16 +316,17 @@ class Model(object):
         g_train_logits = dict()
         g_train_ces = dict()
         g_loss_adversarial = 0.0
-        for i, j in np.argwhere(streams):
-            disc_input = kerasify(tf_corrupt(recs[(i,j)], noise_level))
-            g_train_logits[(i,j)] = disc(disc_input)
+        for i, j in np.argwhere(cross_streams):
+            disc_input_from = kerasify(tf_corrupt(inputs[i], noise_level))
+            disc_input_to = kerasify(tf_corrupt(recs[(i,j)], noise_level))
+            g_train_logits[(i,j)] = disc([disc_input_from, disc_input_to])
             bs = (tf.shape(g_train_logits[(i,j)])[0],)
-            target_label = label_map[j]
+            target_label = label_map["real"][(i,j)]
             g_train_ces[(i,j)] = tf.losses.sparse_softmax_cross_entropy(
                     labels = target_label * tf.ones(bs, dtype = tf.int32),
                     logits = g_train_logits[(i,j)])
             g_loss_adversarial += g_train_ces[(i,j)]
-        g_loss_adversarial = g_loss_adversarial / np.argwhere(streams).shape[0]
+        g_loss_adversarial = g_loss_adversarial / np.argwhere(cross_streams).shape[0]
         g_loss += g_adversarial_weight * g_loss_adversarial
 
         # generator training
@@ -339,15 +342,16 @@ class Model(object):
         d_train_real_logits = dict()
         d_train_real_ces = dict()
         d_loss = 0.0
-        for i in output_streams:
-            disc_input = kerasify(tf_corrupt(d_train_pos_inputs[i], noise_level))
-            d_train_real_logits[i] = disc(disc_input)
+        for i, j in np.argwhere(cross_streams):
+            disc_input_from = kerasify(tf_corrupt(d_train_pos_inputs[i], noise_level))
+            disc_input_to = kerasify(tf_corrupt(d_train_pos_inputs[j], noise_level))
+            d_train_real_logits[i] = disc([disc_input_from, disc_input_to])
             bs = (tf.shape(d_train_real_logits[i])[0],)
-            target_label = label_map[i]
+            target_label = label_map["real"][(i, j)]
             d_train_real_ces[i] = tf.losses.sparse_softmax_cross_entropy(
                     labels = target_label * tf.ones(bs, dtype = tf.int32),
                     logits = d_train_real_logits[i])
-            d_loss += d_train_real_ces[i] / len(output_streams)
+            d_loss += d_train_real_ces[i] / np.argwhere(cross_streams).shape[0]
 
         # negative discriminator samples
         # need new independent samples to produce fake images as negative
@@ -356,18 +360,19 @@ class Model(object):
         d_train_recs = dict()
         d_train_fake_logits = dict()
         d_train_fake_ces = dict()
-        for i, j in np.argwhere(streams):
+        for i, j in np.argwhere(cross_streams):
             d_train_recs[(i,j)], _, _ = self.ae_pipeline(
                     d_train_neg_inputs[i], d_train_neg_inputs[j],
                     head_encs[i], shared_enc, shared_dec, tail_decs[j])
-            disc_input = kerasify(tf_corrupt(d_train_recs[(i,j)], noise_level))
-            d_train_fake_logits[(i,j)] = disc(disc_input)
+            disc_input_from = kerasify(tf_corrupt(d_train_neg_inputs[i], noise_level))
+            disc_input_to = kerasify(tf_corrupt(d_train_recs[(i,j)], noise_level))
+            d_train_fake_logits[(i,j)] = disc([disc_input_from, disc_input_to])
             bs = (tf.shape(d_train_fake_logits[(i,j)])[0],)
-            target_label = label_map[(i,j)]
+            target_label = label_map["fake"][(i,j)]
             d_train_fake_ces[(i,j)] = tf.losses.sparse_softmax_cross_entropy(
                     labels = target_label * tf.ones(bs, dtype = tf.int32),
                     logits = d_train_fake_logits[(i,j)])
-            d_loss += d_train_fake_ces[(i,j)] / np.argwhere(streams).shape[0]
+            d_loss += d_train_fake_ces[(i,j)] / np.argwhere(cross_streams).shape[0]
 
         # discriminator training
         d_trainable_weights = disc.trainable_weights
@@ -381,7 +386,7 @@ class Model(object):
         noise_control = target_ratio * g_loss_adversarial - d_loss
         update_noise_level = tf.assign(
                 noise_level,
-                tf.clip_by_value(noise_level + 1e-3 * noise_control, 0, 1))
+                tf.clip_by_value(noise_level + 1e-3 * noise_control, 0, 10))
 
         # ops
         self.inputs = {
@@ -447,9 +452,9 @@ class Model(object):
             X_batch, Y_batch = next(batches)
             X1_batch, Y1_batch = next(batches)
             X2_batch, Y2_batch = next(batches)
-            # cross over to avoid correlation during discriminator training
-            X_pos_batch, Y_pos_batch = X1_batch, Y2_batch
-            X_neg_batch, Y_neg_batch = X2_batch, Y1_batch
+
+            X_pos_batch, Y_pos_batch = X1_batch, Y1_batch
+            X_neg_batch, Y_neg_batch = X2_batch, Y2_batch
             feed_dict = {
                     self.inputs["g"][0]: X_batch,
                     self.inputs["g"][1]: Y_batch,
@@ -660,11 +665,13 @@ class Model(object):
         norm_op = keras_normalize
         acti_op = lambda x: keras_activate(x, "leakyrelu")
         gavg_op = keras_global_avg
+        conc_op = keras_concatenate
 
         # inputs
-        input_ = keras.layers.Input(in_shape)
+        input_from = keras.layers.Input(in_shape)
+        input_to = keras.layers.Input(in_shape)
 
-        features = input_
+        features = conc_op([input_from, input_to])
         for i in range(n_layers):
             features = conv_op(features, 5, 2**i*n_features, stride = 2)
             features = norm_op(features)
@@ -672,7 +679,7 @@ class Model(object):
         features = conv_op(features, 5, n_labels, stride = 2)
         logits = gavg_op(features)
 
-        return keras.models.Model(input_, logits)
+        return keras.models.Model([input_from, input_to], logits)
 
 
 if __name__ == "__main__":
