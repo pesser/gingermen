@@ -199,12 +199,20 @@ def keras_conv(x, kernel_size, filters, stride = 1):
 
 
 def keras_conv_transposed(x, kernel_size, filters, stride = 1):
+    """
     return keras.layers.Conv2DTranspose(
             filters = filters,
             kernel_size = kernel_size,
             strides = stride,
             padding = "SAME",
             kernel_initializer = kernel_initializer)(x)
+    """
+    # TODO
+    if stride == 2:
+        x = keras.layers.UpSampling2D()(x)
+        return keras_conv(x, kernel_size, filters, stride = 1)
+    else:
+        return keras_conv(x, kernel_size, filters, stride = 1)
 
 
 def keras_global_avg(x):
@@ -260,7 +268,7 @@ class Model(object):
         self.img_ops = {}
 
         global_step = tf.Variable(0, trainable = False, name = "global_step")
-        noise_level = tf.Variable(1.0, trainable = False, dtype = tf.float32, name = "noise_level")
+        d_control = tf.Variable(0.0, trainable = False, dtype = tf.float32, name = "d_control")
 
         n_domains = 2
 
@@ -309,23 +317,22 @@ class Model(object):
             label_map["real"][(i,j)] = label * 2 + 0
             label_map["fake"][(i,j)] = label * 2 + 1
         n_labels = len(label_map)
-        disc = self.make_discriminator(self.img_shape, n_features = 64, n_layers = 5, n_labels = n_labels)
+        #disc = self.make_discriminator(self.img_shape, n_features = 64, n_layers = 5, n_labels = n_labels)
+        d_head = self.make_det_enc(self.img_shape, n_features = 64, n_layers = 2)
+        d_head_output_shape = K.int_shape(d_head.outputs[0])[1:]
+        d_enc = self.make_enc(d_head_output_shape, n_features = 256, n_layers =3)
+        d_dec = self.make_dec(d_head_output_shape, n_features = 256, n_layers =3)
+        d_tail = self.make_det_dec(self.img_shape, n_features = 64, n_layers = 2)
 
         # adversarial loss for g
         g_adversarial_weight = 0.01
-        g_train_logits = dict()
-        g_train_ces = dict()
         g_loss_adversarial = 0.0
         for i, j in np.argwhere(cross_streams):
-            disc_input_from = kerasify(tf_corrupt(inputs[i], noise_level))
-            disc_input_to = kerasify(tf_corrupt(recs[(i,j)], noise_level))
-            g_train_logits[(i,j)] = disc([disc_input_from, disc_input_to])
-            bs = (tf.shape(g_train_logits[(i,j)])[0],)
-            target_label = label_map["real"][(i,j)]
-            g_train_ces[(i,j)] = tf.losses.sparse_softmax_cross_entropy(
-                    labels = target_label * tf.ones(bs, dtype = tf.int32),
-                    logits = g_train_logits[(i,j)])
-            g_loss_adversarial += g_train_ces[(i,j)]
+            # only for translation streams
+            rec, rec_loss, lat_loss = self.ae_pipeline(
+                    recs[(i,j)], recs[(i,j)],
+                    d_head, d_enc, d_dec, d_tail)
+            g_loss_adversarial += rec_loss
         g_loss_adversarial = g_loss_adversarial / np.argwhere(cross_streams).shape[0]
         g_loss += g_adversarial_weight * g_loss_adversarial
 
@@ -337,56 +344,58 @@ class Model(object):
                 learning_rate = self.lr, beta1 = 0.5, beta2 = 0.9)
         g_train = g_optimizer.minimize(g_loss, var_list = g_trainable_weights, global_step = global_step)
 
+
+        d_recs = dict()
         # positive discriminator samples
         d_train_pos_inputs = [tf.placeholder(tf.float32, shape = (None,) + self.img_shape) for i in range(n_domains)]
-        d_train_real_logits = dict()
-        d_train_real_ces = dict()
         d_loss = 0.0
-        for i, j in np.argwhere(cross_streams):
-            disc_input_from = kerasify(tf_corrupt(d_train_pos_inputs[i], noise_level))
-            disc_input_to = kerasify(tf_corrupt(d_train_pos_inputs[j], noise_level))
-            d_train_real_logits[i] = disc([disc_input_from, disc_input_to])
-            bs = (tf.shape(d_train_real_logits[i])[0],)
-            target_label = label_map["real"][(i, j)]
-            d_train_real_ces[i] = tf.losses.sparse_softmax_cross_entropy(
-                    labels = target_label * tf.ones(bs, dtype = tf.int32),
-                    logits = d_train_real_logits[i])
-            d_loss += d_train_real_ces[i] / np.argwhere(cross_streams).shape[0]
+        d_loss_pos = 0.0
+        for i in output_streams:
+            rec, rec_loss, lat_loss = self.ae_pipeline(
+                    d_train_pos_inputs[i], d_train_pos_inputs[i],
+                    d_head, d_enc, d_dec, d_tail)
+            d_loss_pos += rec_loss + lat_loss
+            d_recs[i] = rec
+        d_loss_pos = d_loss_pos / len(output_streams)
+        d_loss += d_loss_pos
 
         # negative discriminator samples
         # need new independent samples to produce fake images as negative
         # samples - could be good to have domain samples independent too
         d_train_neg_inputs = [tf.placeholder(tf.float32, shape = (None,) + self.img_shape) for i in range(n_domains)]
-        d_train_recs = dict()
-        d_train_fake_logits = dict()
-        d_train_fake_ces = dict()
+        d_loss_neg = 0.0
         for i, j in np.argwhere(cross_streams):
-            d_train_recs[(i,j)], _, _ = self.ae_pipeline(
+            d_train_rec, _, _ = self.ae_pipeline(
                     d_train_neg_inputs[i], d_train_neg_inputs[j],
                     head_encs[i], shared_enc, shared_dec, tail_decs[j])
-            disc_input_from = kerasify(tf_corrupt(d_train_neg_inputs[i], noise_level))
-            disc_input_to = kerasify(tf_corrupt(d_train_recs[(i,j)], noise_level))
-            d_train_fake_logits[(i,j)] = disc([disc_input_from, disc_input_to])
-            bs = (tf.shape(d_train_fake_logits[(i,j)])[0],)
-            target_label = label_map["fake"][(i,j)]
-            d_train_fake_ces[(i,j)] = tf.losses.sparse_softmax_cross_entropy(
-                    labels = target_label * tf.ones(bs, dtype = tf.int32),
-                    logits = d_train_fake_logits[(i,j)])
-            d_loss += d_train_fake_ces[(i,j)] / np.argwhere(cross_streams).shape[0]
+            rec, rec_loss, lat_loss = self.ae_pipeline(
+                    d_train_rec, d_train_rec,
+                    d_head, d_enc, d_dec, d_tail)
+            d_loss_neg += rec_loss + lat_loss
+            d_recs[(i,j)] = rec
+        d_loss_neg = d_loss_neg / np.argwhere(cross_streams).shape[0]
+        d_loss -= d_control * d_loss_neg
 
         # discriminator training
-        d_trainable_weights = disc.trainable_weights
+        d_trainable_weights = (
+                d_head.trainable_weights +
+                d_enc.trainable_weights +
+                d_dec.trainable_weights +
+                d_tail.trainable_weights)
         d_optimizer = tf.train.AdamOptimizer(
                 learning_rate = self.lr, beta1 = 0.5, beta2 = 0.9)
         d_train = d_optimizer.minimize(d_loss, var_list = d_trainable_weights)
 
-        # noise level training
-        # ratio of loss(discriminator) / loss(generator)
-        target_ratio = 4 / 5
-        noise_control = target_ratio * g_loss_adversarial - d_loss
-        update_noise_level = tf.assign(
-                noise_level,
-                tf.clip_by_value(noise_level + 1e-3 * noise_control, 0, 10))
+        # discriminator control training
+        # ratio of loss(generator) / loss(discriminator)
+        target_ratio = 0.3
+        control_value = target_ratio * d_loss_pos - d_loss_neg
+        update_d_control = tf.assign(
+                d_control,
+                tf.clip_by_value(d_control + 1e-3 * control_value, 0, 1))
+
+        # convergence measure
+        convergence_measure = d_loss_pos + tf.abs(control_value)
 
         # ops
         self.inputs = {
@@ -396,13 +405,15 @@ class Model(object):
         self.train_ops = {
                 "g": g_train,
                 "d": d_train,
-                "noise": update_noise_level}
+                "d_control": update_d_control}
         self.log_ops = {
                 "g_loss": g_loss,
                 "g_loss_adversarial": g_loss_adversarial,
                 "d_loss": d_loss,
-                "noise_control": noise_control,
-                "noise_level": noise_level,
+                "d_loss_pos": d_loss_pos,
+                "d_loss_neg": d_loss_neg,
+                "d_control": d_control,
+                "convergence_measure": convergence_measure,
                 "global_step": global_step}
         self.img_ops = {}
         for i in range(n_domains):
@@ -411,8 +422,13 @@ class Model(object):
             self.log_ops["rec_loss_{}_{}".format(i,j)] = rec_losses[(i,j)]
             self.log_ops["lat_loss_{}_{}".format(i,j)] = lat_losses[(i,j)]
             self.img_ops["rec_{}_{}".format(i,j)] = recs[(i,j)]
+        for i, j in np.argwhere(cross_streams):
+            self.img_ops["d_rec_{}_{}".format(i,j)] = d_recs[(i,j)]
+        for i in output_streams:
+            self.img_ops["d_rec_{}".format(i)] = d_recs[i]
         for i, sample in samples.items():
             self.img_ops["sample_{}".format(i)] = sample
+
 
         for k, v in self.log_ops.items():
             tf.summary.scalar(k, v)
@@ -490,7 +506,11 @@ class Model(object):
                 feed_dict = {
                         self.inputs["g"][0]: batch[0],
                         self.inputs["g"][1]: batch[1]}
-                imgs = session.run(self.img_ops, feed_dict)
+                fetch_dict = dict()
+                for k, v in self.img_ops.items():
+                    if not k.startswith("d_"):
+                        fetch_dict[k] = v
+                imgs = session.run(fetch_dict, feed_dict)
                 for k, v in imgs.items():
                     plot_images(v, "valid_" + k + "_{:07}".format(global_step))
         if global_step % self.save_frequency == self.save_frequency - 1:
@@ -567,15 +587,18 @@ class Model(object):
         means = []
         vars_ = []
 
+        # maximum number of feature maps
+        mf = 512
+
         features = input_
         for i in range(n_layers):
-            mean = conv_op(features, 1, 2**(i+1)*n_features, stride = 1)
-            var_ = conv_op(features, 1, 2**(i+1)*n_features, stride = 1)
+            mean = conv_op(features, 1, min(2**(i+1)*n_features,mf), stride = 1)
+            var_ = conv_op(features, 1, min(2**(i+1)*n_features,mf), stride = 1)
             var_ = soft_op(var_)
             means.append(mean)
             vars_.append(var_)
             if i + 1 < n_layers:
-                features = conv_op(features, 5, 2**i*n_features, stride = 2)
+                features = conv_op(features, 5, min(2**i*n_features,mf), stride = 2)
                 features = norm_op(features)
                 features = acti_op(features)
 
@@ -590,12 +613,15 @@ class Model(object):
         norm_op = keras_normalize
         acti_op = lambda x: keras_activate(x, "leakyrelu")
 
+        # maximum number of feature maps
+        mf = 512
+
         # inputs
         inputs = []
         for l in range(n_layers):
             in_shape = (
                     tuple(out_shape[i] // 2**l for i in range(len(out_shape) - 1)) +
-                    (n_features * 2**(l+1),))
+                    (min(n_features * 2**(l+1),mf),))
             inputs.append(keras.layers.Input(shape = in_shape))
 
         # build top down
@@ -604,7 +630,7 @@ class Model(object):
                 features = inputs[l]
             else:
                 features = conc_op([features, inputs[l]])
-            features = conv_op(features, 5, 2**l*n_features, stride = 2)
+            features = conv_op(features, 5, min(2**l*n_features,mf), stride = 2)
             features = norm_op(features)
             features = acti_op(features)
 
