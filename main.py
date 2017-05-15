@@ -2,9 +2,6 @@ import tensorflow as tf
 config = tf.ConfigProto()
 config.gpu_options.allow_growth = False
 session = tf.Session(config = config)
-import keras.backend as K
-K.set_session(session)
-import keras
 
 import os, sys, logging, shutil, datetime, socket, time, math, functools, itertools
 import numpy as np
@@ -157,77 +154,6 @@ def plot_images(X, name):
     PIL.Image.fromarray(np.uint8(255*canvas)).save(fname)
 
 
-kernel_initializer = "glorot_uniform"
-
-
-def keras_subpixel_upsampling(x):
-    def lambda_subpixel(X):
-        return tf.depth_to_space(X, 2)
-    return keras.layers.Lambda(lambda_subpixel)(x)
-
-
-def keras_activate(x, method = "relu"):
-    if method == "leakyrelu":
-        x = keras.layers.advanced_activations.LeakyReLU()(x)
-        return x
-    else:
-        x = keras.layers.Activation(method)(x)
-        return x
-
-
-def keras_concatenate(xs):
-    return keras.layers.Concatenate(axis = -1)(xs)
-
-
-def keras_dense_to_conv(x, spatial, features):
-    x = keras.layers.Dense(units = spatial*spatial*features,
-            kernel_initializer = kernel_initializer)(x)
-    return keras.layers.Reshape((spatial, spatial, features))(x)
-
-
-def keras_normalize(x):
-    return keras.layers.BatchNormalization(momentum = 0.9, epsilon = 1e-5)(x, training = False)
-
-
-def keras_conv(x, kernel_size, filters, stride = 1):
-    return keras.layers.Conv2D(
-            filters = filters,
-            kernel_size = kernel_size,
-            strides = stride,
-            padding = "SAME",
-            kernel_initializer = kernel_initializer)(x)
-
-
-def keras_conv_transposed(x, kernel_size, filters, stride = 1):
-    """
-    return keras.layers.Conv2DTranspose(
-            filters = filters,
-            kernel_size = kernel_size,
-            strides = stride,
-            padding = "SAME",
-            kernel_initializer = kernel_initializer)(x)
-    """
-    # TODO
-    if stride == 2:
-        x = keras.layers.UpSampling2D()(x)
-        return keras_conv(x, kernel_size, filters, stride = 1)
-    else:
-        return keras_conv(x, kernel_size, filters, stride = 1)
-
-
-def keras_global_avg(x):
-    return keras.layers.GlobalAveragePooling2D()(x)
-
-
-def keras_to_dense(x, features):
-    x = keras.layers.Flatten()(x)
-    return keras.layers.Dense(units = features, kernel_initializer = kernel_initializer)(x)
-
-
-def kerasify(x):
-    return keras.layers.InputLayer(input_shape = K.int_shape(x)[1:])(x)
-
-
 def make_linear_var(
         step,
         start, end,
@@ -246,18 +172,253 @@ def tf_corrupt(x, eps):
     return x + eps * tf.random_normal(tf.shape(x), mean = 0.0, stddev = 1.0)
 
 
+def tf_conv(x, kernel_size, filters, stride = 1):
+    return tf.layers.conv2d(
+            inputs = x,
+            filters = filters,
+            kernel_size = kernel_size,
+            strides = stride,
+            padding = "SAME",
+            activation = None)
+
+
+def tf_conv_transposed(x, kernel_size, filters, stride = 1):
+    return tf.layers.conv2d_transpose(
+            inputs = x,
+            filters = filters,
+            kernel_size = kernel_size,
+            strides = stride,
+            padding = "SAME",
+            activation = None)
+
+
+def tf_activate(x, activation):
+    if activation == "leakyrelu":
+        return tf.maximum(0.2*x, x)
+    elif activation == "softplus":
+        return tf.nn.softplus(x)
+    elif activation == "tanh":
+        return tf.tanh(x)
+    else:
+        raise ValueError(activation)
+
+
+def tf_concatenate(x):
+    return tf.concat(x, axis = -1)
+
+
+def tf_normalize(x):
+    return tf.layers.batch_normalization(
+            inputs = x,
+            axis = -1,
+            momentum = 0.9)
+
+
+def ae_pipeline(input_, target, head_enc, enc, dec, tail_dec, loss = "l1"):
+    head_encoding = head_enc(input_)
+
+    enc_encodings = enc(head_encoding)
+    enc_encodings_z, enc_lat_loss = ae_sampling(enc_encodings)
+
+    decoding = dec(enc_encodings_z)
+    tail_decoding = tail_dec(decoding)
+
+    lat_loss = enc_lat_loss
+    if loss == "l2":
+        rec_loss = tf.reduce_mean(tf.contrib.layers.flatten(
+            tf.square(target - tail_decoding)))
+    elif loss == "l1":
+        rec_loss = tf.reduce_mean(tf.contrib.layers.flatten(
+            tf.abs(target - tail_decoding)))
+    else:
+        raise NotImplemented("Unknown loss function: {}".format(loss))
+
+    return tail_decoding, rec_loss, lat_loss
+
+
+def sample_pipeline(n_samples, dec, det_dec):
+    zs = []
+    for input_shape in dec.input_shapes:
+        z_shape = [n_samples] + input_shape[1:]
+        z = tf.random_normal(z_shape, mean = 0.0, stddev = 1.0)
+        zs.append(z)
+    decoding = dec(zs)
+    tail_decoding = det_dec(decoding)
+    return tail_decoding
+
+
+def ae_sampling(encodings):
+    means, vars_ = encodings[:len(encodings)//2], encodings[len(encodings)//2:]
+    kl = 0.0
+    zs = []
+    for mean, var in zip(means, vars_):
+        z_shape = tf.shape(mean)
+        eps = tf.random_normal(z_shape, mean = 0.0, stddev = 1.0)
+        z = mean + tf.sqrt(var) * eps
+        zs.append(z)
+        kl += 0.5 * tf.reduce_mean(tf.contrib.layers.flatten(
+            tf.square(mean) + var - tf.log(var) - 1.0))
+    kl = kl / float(len(means))
+    return zs, kl
+
+
+class TFModel(object):
+    def __init__(self, name, run, input_shapes = None):
+        self.name = name
+        self.run = run
+        self.input_shapes = input_shapes
+        self.initialized = False
+
+
+    def __call__(self, inputs):
+        if self.input_shapes is None:
+            try:
+                self.input_shapes = inputs.get_shape().as_list()
+            except AttributeError:
+                self.input_shapes = [input_.get_shape().as_list() for input_ in inputs]
+
+        with tf.variable_scope(self.name, reuse = self.initialized):
+            result = self.run(inputs)
+        self.initialized = True
+        return result
+ 
+
+    @property
+    def trainable_weights(self):
+        return tf.get_collection(tf.GraphKeys.TRAINABLE_VARIABLES, scope = self.name)
+
+
+def make_model(name, run, **kwargs):
+    runl = lambda x: run(x, **kwargs)
+    return TFModel(name, runl)
+
+
+def make_enc(input_, power_features, n_layers):
+    """Stochastic ladder encoder."""
+    # ops
+    conv_op = tf_conv
+    soft_op = lambda x: tf_activate(x, "softplus")
+    norm_op = tf_normalize
+    acti_op = lambda x: tf_activate(x, "leakyrelu")
+
+    # outputs
+    means = []
+    vars_ = []
+
+    pf = power_features
+
+    features = input_
+    for i in range(n_layers):
+        mean = conv_op(features, 1, 2**(pf+i), stride = 1)
+        var_ = conv_op(features, 1, 2**(pf+i), stride = 1)
+        var_ = soft_op(var_)
+        means.append(mean)
+        vars_.append(var_)
+        if i + 1 < n_layers:
+            features = conv_op(features, 5, 2**(pf+i), stride = 2)
+            features = norm_op(features)
+            features = acti_op(features)
+
+    return means + vars_
+
+
+def make_dec(inputs, power_features, n_layers):
+    """Stochastic ladder decoder."""
+    # ops
+    conv_op = tf_conv_transposed
+    conc_op = tf_concatenate
+    norm_op = tf_normalize
+    acti_op = lambda x: tf_activate(x, "leakyrelu")
+
+    pf = power_features
+
+    # build top down
+    for l in reversed(range(n_layers)):
+        if l == n_layers - 1:
+            features = inputs[l]
+        else:
+            features = conc_op([features, inputs[l]])
+        features = conv_op(features, 5, 2**(pf+l), stride = 2)
+        features = norm_op(features)
+        features = acti_op(features)
+
+    return features
+
+
+def make_det_enc(input_, power_features, n_layers):
+    """Deterministic encoder."""
+    # ops
+    conv_op = tf_conv
+    norm_op = tf_normalize
+    acti_op = lambda x: tf_activate(x, "leakyrelu")
+
+    pf = power_features
+
+    features = input_
+    for i in range(n_layers):
+        features = conv_op(features, 5, 2**(pf+i), stride = 2)
+        features = norm_op(features)
+        features = acti_op(features)
+
+    return features
+
+
+def make_det_dec(input_, power_features, n_layers, out_channels = 3):
+    """Deterministic decoder. Expects upsampled input."""
+    # ops
+    conv_op = tf_conv_transposed
+    conc_op = tf_concatenate
+    norm_op = tf_normalize
+    acti_op = lambda x: tf_activate(x, "leakyrelu")
+    tanh_op = lambda x: tf_activate(x, "tanh")
+
+    pf = power_features
+
+    # build top down
+    features = input_
+    for l in reversed(range(n_layers)):
+        if l > 0:
+            features = conv_op(features, 5, 2**(pf+l-1), stride = 2)
+            features = norm_op(features)
+            features = acti_op(features)
+    output = conv_op(features, 5, out_channels, stride = 1)
+    output = tanh_op(output)
+
+    return output
+
+
 class Model(object):
     def __init__(self, img_shape, n_total_steps, restore_path = None):
         self.img_shape = img_shape
         self.lr = 1e-4
         self.n_total_steps = n_total_steps
-        self.log_frequency = 50
+        self.log_frequency = 250
         self.save_frequency = 500
         self.define_graph()
         self.restore_path = restore_path
         self.checkpoint_dir = os.path.join(out_dir, "checkpoints")
         os.makedirs(self.checkpoint_dir, exist_ok = True)
         self.init_graph()
+
+
+    def make_det_enc(self, name):
+        return make_model(name, make_det_enc,
+                power_features = 5, n_layers = 2)
+
+
+    def make_det_dec(self, name):
+        return make_model(name, make_det_dec,
+                power_features = 5, n_layers = 2)
+
+
+    def make_enc(self, name):
+        return make_model(name, make_enc,
+                power_features = 7, n_layers = 4)
+
+
+    def make_dec(self, name):
+        return make_model(name, make_dec,
+                power_features = 7, n_layers = 4)
 
 
     def define_graph(self):
@@ -281,11 +442,10 @@ class Model(object):
         output_streams = np.nonzero(np.any(streams, axis = 0))[0]
 
         # encoder-decoder pipeline
-        head_encs = [self.make_det_enc(self.img_shape, n_features = 64, n_layers = 2) for i in range(n_domains)]
-        head_output_shape = K.int_shape(head_encs[0].outputs[0])[1:]
-        shared_enc = self.make_enc(head_output_shape, n_features = 256, n_layers = 3)
-        shared_dec = self.make_dec(head_output_shape, n_features = 256, n_layers = 3)
-        tail_decs = [self.make_det_dec(self.img_shape, n_features = 64, n_layers = 2) for i in range(n_domains)]
+        head_encs = [self.make_det_enc("generator_head_{}".format(i)) for i in range(n_domains)]
+        shared_enc = self.make_enc("generator_enc")
+        shared_dec = self.make_dec("generator_dec")
+        tail_decs = [self.make_det_dec("generator_tail_{}".format(i)) for i in range(n_domains)]
 
         # supervised g training, i.e. x and y are correpsonding pairs
         inputs = [tf.placeholder(tf.float32, shape = (None,) + self.img_shape) for i in range(n_domains)]
@@ -293,7 +453,7 @@ class Model(object):
         rec_losses = dict()
         lat_losses = dict()
         for i, j in np.argwhere(streams):
-            recs[(i,j)], rec_losses[(i,j)], lat_losses[(i,j)] = self.ae_pipeline(
+            recs[(i,j)], rec_losses[(i,j)], lat_losses[(i,j)] = ae_pipeline(
                     inputs[i], inputs[j],
                     head_encs[i], shared_enc, shared_dec, tail_decs[j])
 
@@ -307,29 +467,22 @@ class Model(object):
         n_samples = 64
         samples = dict()
         for out_stream in output_streams:
-            samples[out_stream] = self.sample_pipeline(n_samples, shared_dec, tail_decs[out_stream])
+            samples[out_stream] = sample_pipeline(n_samples, shared_dec, tail_decs[out_stream])
 
         # adversarial training
         # label for each cross translation stream whether this is a real pair or
         # fake pair
-        label_map = {"real": dict(), "fake": dict()}
-        for label, (i, j) in enumerate(np.argwhere(cross_streams)):
-            label_map["real"][(i,j)] = label * 2 + 0
-            label_map["fake"][(i,j)] = label * 2 + 1
-        n_labels = len(label_map)
-        #disc = self.make_discriminator(self.img_shape, n_features = 64, n_layers = 5, n_labels = n_labels)
-        d_head = self.make_det_enc(self.img_shape, n_features = 64, n_layers = 2)
-        d_head_output_shape = K.int_shape(d_head.outputs[0])[1:]
-        d_enc = self.make_enc(d_head_output_shape, n_features = 256, n_layers =3)
-        d_dec = self.make_dec(d_head_output_shape, n_features = 256, n_layers =3)
-        d_tail = self.make_det_dec(self.img_shape, n_features = 64, n_layers = 2)
+        d_head = self.make_det_enc("discriminator_head")
+        d_enc = self.make_enc("discriminator_enc")
+        d_dec = self.make_dec("discriminator_dec")
+        d_tail = self.make_det_dec("discriminator_tail")
 
         # adversarial loss for g
         g_adversarial_weight = 0.01
         g_loss_adversarial = 0.0
         for i, j in np.argwhere(cross_streams):
             # only for translation streams
-            rec, rec_loss, lat_loss = self.ae_pipeline(
+            rec, rec_loss, lat_loss = ae_pipeline(
                     recs[(i,j)], recs[(i,j)],
                     d_head, d_enc, d_dec, d_tail)
             g_loss_adversarial += rec_loss
@@ -351,7 +504,7 @@ class Model(object):
         d_loss = 0.0
         d_loss_pos = 0.0
         for i in output_streams:
-            rec, rec_loss, lat_loss = self.ae_pipeline(
+            rec, rec_loss, lat_loss = ae_pipeline(
                     d_train_pos_inputs[i], d_train_pos_inputs[i],
                     d_head, d_enc, d_dec, d_tail)
             d_loss_pos += rec_loss + lat_loss
@@ -365,10 +518,10 @@ class Model(object):
         d_train_neg_inputs = [tf.placeholder(tf.float32, shape = (None,) + self.img_shape) for i in range(n_domains)]
         d_loss_neg = 0.0
         for i, j in np.argwhere(cross_streams):
-            d_train_rec, _, _ = self.ae_pipeline(
+            d_train_rec, _, _ = ae_pipeline(
                     d_train_neg_inputs[i], d_train_neg_inputs[j],
                     head_encs[i], shared_enc, shared_dec, tail_decs[j])
-            rec, rec_loss, lat_loss = self.ae_pipeline(
+            rec, rec_loss, lat_loss = ae_pipeline(
                     d_train_rec, d_train_rec,
                     d_head, d_enc, d_dec, d_tail)
             d_loss_neg += rec_loss + lat_loss
@@ -388,7 +541,7 @@ class Model(object):
 
         # discriminator control training
         # ratio of loss(generator) / loss(discriminator)
-        target_ratio = 0.3
+        target_ratio = 0.6
         control_value = target_ratio * d_loss_pos - d_loss_neg
         update_d_control = tf.assign(
                 d_control,
@@ -469,8 +622,8 @@ class Model(object):
             X1_batch, Y1_batch = next(batches)
             X2_batch, Y2_batch = next(batches)
 
-            X_pos_batch, Y_pos_batch = X1_batch, Y1_batch
-            X_neg_batch, Y_neg_batch = X2_batch, Y2_batch
+            X_pos_batch, Y_pos_batch = X1_batch, Y2_batch
+            X_neg_batch, Y_neg_batch = X2_batch, Y1_batch
             feed_dict = {
                     self.inputs["g"][0]: X_batch,
                     self.inputs["g"][1]: Y_batch,
@@ -522,190 +675,6 @@ class Model(object):
             logging.info("Saved model to {}".format(fname))
 
 
-    def ae_pipeline(self, input_, target, head_enc, enc, dec, tail_dec, loss = "l1"):
-        input_ = kerasify(input_)
-        head_encoding = head_enc(input_)
-
-        enc_encodings = enc(head_encoding)
-        enc_encodings_z, enc_lat_loss = self.ae_sampling(enc_encodings)
-
-        enc_encodings_z = [kerasify(z) for z in enc_encodings_z]
-        decoding = dec(enc_encodings_z)
-        tail_decoding = tail_dec(decoding)
-
-        lat_loss = enc_lat_loss
-        if loss == "l2":
-            rec_loss = tf.reduce_mean(tf.contrib.layers.flatten(
-                tf.square(target - tail_decoding)))
-        elif loss == "l1":
-            rec_loss = tf.reduce_mean(tf.contrib.layers.flatten(
-                tf.abs(target - tail_decoding)))
-        else:
-            raise NotImplemented("Unknown loss function: {}".format(loss))
-
-        return tail_decoding, rec_loss, lat_loss
-
-    
-    def sample_pipeline(self, n_samples, dec, det_dec):
-        zs = []
-        for input_ in dec.inputs:
-            z_shape = (n_samples,) + K.int_shape(input_)[1:]
-            z = tf.random_normal(z_shape, mean = 0.0, stddev = 1.0)
-            z = kerasify(z)
-            zs.append(z)
-        decoding = dec(zs)
-        tail_decoding = det_dec(decoding)
-        return tail_decoding
-
-
-    def ae_sampling(self, encodings):
-        means, vars_ = encodings[:len(encodings)//2], encodings[len(encodings)//2:]
-        kl = 0.0
-        zs = []
-        for mean, var in zip(means, vars_):
-            z_shape = tf.shape(mean)
-            eps = tf.random_normal(z_shape, mean = 0.0, stddev = 1.0)
-            z = mean + tf.sqrt(var) * eps
-            zs.append(z)
-            kl += 0.5 * tf.reduce_mean(tf.contrib.layers.flatten(
-                tf.square(mean) + var - tf.log(var) - 1.0))
-        kl = kl / float(len(means))
-        return zs, kl
-
-
-    def make_enc(self, in_shape, n_features, n_layers):
-        """Stochastic ladder encoder."""
-        # ops
-        conv_op = keras_conv
-        soft_op = lambda x: keras_activate(x, "softplus")
-        norm_op = keras_normalize
-        acti_op = lambda x: keras_activate(x, "leakyrelu")
-
-        # inputs
-        input_ = keras.layers.Input(in_shape)
-        # outputs
-        means = []
-        vars_ = []
-
-        # maximum number of feature maps
-        mf = 512
-
-        features = input_
-        for i in range(n_layers):
-            mean = conv_op(features, 1, min(2**(i+1)*n_features,mf), stride = 1)
-            var_ = conv_op(features, 1, min(2**(i+1)*n_features,mf), stride = 1)
-            var_ = soft_op(var_)
-            means.append(mean)
-            vars_.append(var_)
-            if i + 1 < n_layers:
-                features = conv_op(features, 5, min(2**i*n_features,mf), stride = 2)
-                features = norm_op(features)
-                features = acti_op(features)
-
-        return keras.models.Model(input_, means + vars_)
-
-
-    def make_dec(self, out_shape, n_features, n_layers):
-        """Stochastic ladder decoder."""
-        # ops
-        conv_op = keras_conv_transposed
-        conc_op = keras_concatenate
-        norm_op = keras_normalize
-        acti_op = lambda x: keras_activate(x, "leakyrelu")
-
-        # maximum number of feature maps
-        mf = 512
-
-        # inputs
-        inputs = []
-        for l in range(n_layers):
-            in_shape = (
-                    tuple(out_shape[i] // 2**l for i in range(len(out_shape) - 1)) +
-                    (min(n_features * 2**(l+1),mf),))
-            inputs.append(keras.layers.Input(shape = in_shape))
-
-        # build top down
-        for l in reversed(range(n_layers)):
-            if l == n_layers - 1:
-                features = inputs[l]
-            else:
-                features = conc_op([features, inputs[l]])
-            features = conv_op(features, 5, min(2**l*n_features,mf), stride = 2)
-            features = norm_op(features)
-            features = acti_op(features)
-
-        return keras.models.Model(inputs, features)
-
-
-    def make_det_enc(self, in_shape, n_features, n_layers):
-        """Deterministic encoder."""
-        # ops
-        conv_op = keras_conv
-        norm_op = keras_normalize
-        acti_op = lambda x: keras_activate(x, "leakyrelu")
-
-        # inputs
-        input_ = keras.layers.Input(in_shape)
-
-        features = input_
-        for i in range(n_layers):
-            features = conv_op(features, 5, 2**i*n_features, stride = 2)
-            features = norm_op(features)
-            features = acti_op(features)
-
-        return keras.models.Model(input_, features)
-
-
-    def make_det_dec(self, out_shape, n_features, n_layers):
-        """Deterministic decoder. Expects upsampled input."""
-        # ops
-        conv_op = keras_conv_transposed
-        conc_op = keras_concatenate
-        norm_op = keras_normalize
-        acti_op = lambda x: keras_activate(x, "leakyrelu")
-        tanh_op = lambda x: keras_activate(x, "tanh")
-
-        # inputs
-        in_shape = (
-                tuple(out_shape[i] // 2**(n_layers-1) for i in range(len(out_shape) - 1)) +
-                (n_features * 2**n_layers,))
-        input_ = keras.layers.Input(shape = in_shape)
-
-        # build top down
-        features = input_
-        for l in reversed(range(n_layers)):
-            if l > 0:
-                features = conv_op(features, 5, 2**(l-1)*n_features, stride = 2)
-                features = norm_op(features)
-                features = acti_op(features)
-        output = conv_op(features, 5, out_shape[-1], stride = 1)
-        output = tanh_op(output)
-
-        return keras.models.Model(input_, output)
-
-
-    def make_discriminator(self, in_shape, n_features, n_layers, n_labels):
-        """Deterministic discriminator."""
-        # ops
-        conv_op = keras_conv
-        norm_op = keras_normalize
-        acti_op = lambda x: keras_activate(x, "leakyrelu")
-        gavg_op = keras_global_avg
-        conc_op = keras_concatenate
-
-        # inputs
-        input_from = keras.layers.Input(in_shape)
-        input_to = keras.layers.Input(in_shape)
-
-        features = conc_op([input_from, input_to])
-        for i in range(n_layers):
-            features = conv_op(features, 5, 2**i*n_features, stride = 2)
-            features = norm_op(features)
-            features = acti_op(features)
-        features = conv_op(features, 5, n_labels, stride = 2)
-        logits = gavg_op(features)
-
-        return keras.models.Model([input_from, input_to], logits)
 
 
 if __name__ == "__main__":
