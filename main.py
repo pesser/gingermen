@@ -390,7 +390,7 @@ def make_det_dec(input_, power_features, n_layers, out_channels = 3):
 class Model(object):
     def __init__(self, img_shape, n_total_steps, restore_path = None):
         self.img_shape = img_shape
-        self.lr = 1e-4
+        self.lr = 5e-5
         self.n_total_steps = n_total_steps
         self.log_frequency = 250
         self.save_frequency = 500
@@ -422,8 +422,6 @@ class Model(object):
 
 
     def define_graph(self):
-        self.latent_dim = 100
-
         self.train_ops = {}
         self.log_ops = {}
         self.img_ops = {}
@@ -440,12 +438,15 @@ class Model(object):
         streams[1,0] = True
         cross_streams = streams & (~np.eye(n_domains, dtype = np.bool))
         output_streams = np.nonzero(np.any(streams, axis = 0))[0]
+        input_streams = np.nonzero(np.any(streams, axis = 1))[0]
 
         # encoder-decoder pipeline
-        head_encs = [self.make_det_enc("generator_head_{}".format(i)) for i in range(n_domains)]
+        head_encs = dict(
+                (i, self.make_det_enc("generator_head_{}".format(i))) for i in input_streams)
         shared_enc = self.make_enc("generator_enc")
         shared_dec = self.make_dec("generator_dec")
-        tail_decs = [self.make_det_dec("generator_tail_{}".format(i)) for i in range(n_domains)]
+        tail_decs = dict(
+                (i, self.make_det_dec("generator_tail_{}".format(i))) for i in output_streams)
 
         # supervised g training, i.e. x and y are correpsonding pairs
         inputs = [tf.placeholder(tf.float32, shape = (None,) + self.img_shape) for i in range(n_domains)]
@@ -491,8 +492,10 @@ class Model(object):
 
         # generator training
         g_trainable_weights = shared_enc.trainable_weights + shared_dec.trainable_weights
-        for i in range(n_domains):
-            g_trainable_weights += head_encs[i].trainable_weights + tail_decs[i].trainable_weights
+        for i in input_streams:
+            g_trainable_weights += head_encs[i].trainable_weights
+        for i in output_streams:
+            g_trainable_weights += tail_decs[i].trainable_weights
         g_optimizer = tf.train.AdamOptimizer(
                 learning_rate = self.lr, beta1 = 0.5, beta2 = 0.9)
         g_train = g_optimizer.minimize(g_loss, var_list = g_trainable_weights, global_step = global_step)
