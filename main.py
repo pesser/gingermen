@@ -23,11 +23,6 @@ def init_logging():
     now = datetime.datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
     out_dir = os.path.join(out_base_dir, now)
     os.makedirs(out_dir, exist_ok = False)
-    # make link to current logging directory for convenience
-    last_link = os.path.join(out_base_dir, "last")
-    if os.path.islink(last_link):
-        os.remove(last_link)
-    os.symlink(out_dir, last_link)
     # copy source code to logging dir to have an idea what the run was about
     this_file = os.path.realpath(__file__)
     assert(this_file.endswith(".py"))
@@ -168,6 +163,27 @@ def make_linear_var(
     return tf.clip_by_value(linear, clip_min, clip_max)
 
 
+def split_batch(batch):
+    batch_a = []
+    batch_b = []
+
+    bsize = batch[0].shape[0]
+    is_even = (bsize % 2 == 0)
+    if is_even:
+        new_bsize = bsize
+    else:
+        new_bsize = bsize - 1
+    middle = new_bsize // 2
+    for d in batch:
+        assert(d.shape[0] == bsize)
+        d = d[:new_bsize]
+        d_a = d[:middle]
+        d_b = d[middle:]
+        batch_a.append(d_a)
+        batch_b.append(d_b)
+    return batch_a, batch_b
+
+
 def tf_corrupt(x, eps):
     return x + eps * tf.random_normal(tf.shape(x), mean = 0.0, stddev = 1.0)
 
@@ -214,7 +230,7 @@ def tf_normalize(x):
             momentum = 0.9)
 
 
-def ae_pipeline(input_, target, head_enc, enc, dec, tail_dec, loss = "l1"):
+def ae_pipeline(input_, target, head_enc, enc, dec, tail_dec, loss = "l2"):
     head_encoding = head_enc(input_)
 
     enc_encodings = enc(head_encoding)
@@ -390,9 +406,9 @@ def make_det_dec(input_, power_features, n_layers, out_channels = 3):
 class Model(object):
     def __init__(self, img_shape, n_total_steps, restore_path = None):
         self.img_shape = img_shape
-        self.lr = 5e-5
+        self.lr = 1e-4
         self.n_total_steps = n_total_steps
-        self.log_frequency = 250
+        self.log_frequency = 50
         self.save_frequency = 500
         self.define_graph()
         self.restore_path = restore_path
@@ -403,22 +419,22 @@ class Model(object):
 
     def make_det_enc(self, name):
         return make_model(name, make_det_enc,
-                power_features = 5, n_layers = 2)
+                power_features = 6, n_layers = 2)
 
 
     def make_det_dec(self, name):
         return make_model(name, make_det_dec,
-                power_features = 5, n_layers = 2)
+                power_features = 6, n_layers = 2)
 
 
     def make_enc(self, name):
         return make_model(name, make_enc,
-                power_features = 7, n_layers = 4)
+                power_features = 8, n_layers = 3)
 
 
     def make_dec(self, name):
         return make_model(name, make_dec,
-                power_features = 7, n_layers = 4)
+                power_features = 8, n_layers = 3)
 
 
     def define_graph(self):
@@ -430,114 +446,170 @@ class Model(object):
         d_control = tf.Variable(0.0, trainable = False, dtype = tf.float32, name = "d_control")
 
         n_domains = 2
+        lat_weight = 0.0
 
         # adjacency matrix of active streams with (i,j) indicating stream
         # from domain i to domain j
-        streams = np.zeros((n_domains, n_domains), dtype = np.bool)
-        streams[0,0] = True
-        streams[1,0] = True
-        cross_streams = streams & (~np.eye(n_domains, dtype = np.bool))
-        output_streams = np.nonzero(np.any(streams, axis = 0))[0]
-        input_streams = np.nonzero(np.any(streams, axis = 1))[0]
+        g_streams = np.zeros((n_domains, n_domains), dtype = np.bool)
+        g_streams[0,0] = True
+        g_streams[1,0] = True
+        g_streams[1,1] = True
+        g_auto_streams = g_streams & (np.eye(n_domains, dtype = np.bool))
+        g_cross_streams = g_streams & (~np.eye(n_domains, dtype = np.bool))
+        g_output_streams = np.nonzero(np.any(g_streams, axis = 0))[0]
+        g_input_streams = np.nonzero(np.any(g_streams, axis = 1))[0]
 
-        # encoder-decoder pipeline
-        head_encs = dict(
-                (i, self.make_det_enc("generator_head_{}".format(i))) for i in input_streams)
-        shared_enc = self.make_enc("generator_enc")
-        shared_dec = self.make_dec("generator_dec")
-        tail_decs = dict(
-                (i, self.make_det_dec("generator_tail_{}".format(i))) for i in output_streams)
+        # generator encoder-decoder pipeline
+        g_head_encs = dict(
+                (i, self.make_det_enc("generator_head_{}".format(i)))
+                for i in g_input_streams)
+        g_enc = self.make_enc("generator_enc")
+        g_dec = self.make_dec("generator_dec")
+        g_tail_decs = dict(
+                (i, self.make_det_dec("generator_tail_{}".format(i)))
+                for i in g_output_streams)
 
-        # supervised g training, i.e. x and y are correpsonding pairs
-        inputs = [tf.placeholder(tf.float32, shape = (None,) + self.img_shape) for i in range(n_domains)]
-        recs = dict()
-        rec_losses = dict()
-        lat_losses = dict()
-        for i, j in np.argwhere(streams):
-            recs[(i,j)], rec_losses[(i,j)], lat_losses[(i,j)] = ae_pipeline(
-                    inputs[i], inputs[j],
-                    head_encs[i], shared_enc, shared_dec, tail_decs[j])
+        # adjacency matrix of active streams with (i,j) indicating stream
+        # from domain i to domain j
+        d_streams = np.zeros((n_domains, n_domains), dtype = np.bool)
+        d_streams[0,0] = True
+        d_streams[0,1] = True
+        d_streams[1,1] = True
+        d_auto_streams = d_streams & (np.eye(n_domains, dtype = np.bool))
+        d_cross_streams = d_streams & (~np.eye(n_domains, dtype = np.bool))
+        d_output_streams = np.nonzero(np.any(d_streams, axis = 0))[0]
+        d_input_streams = np.nonzero(np.any(d_streams, axis = 1))[0]
 
-        # supervised g training
-        g_loss = 0
-        for i,j in np.argwhere(streams):
-            g_loss += rec_losses[(i,j)] + lat_losses[(i,j)]
-        g_loss = g_loss / np.argwhere(streams).shape[0]
-
-        # visualize latent space (only for active output streams)
-        n_samples = 64
-        samples = dict()
-        for out_stream in output_streams:
-            samples[out_stream] = sample_pipeline(n_samples, shared_dec, tail_decs[out_stream])
-
-        # adversarial training
-        # label for each cross translation stream whether this is a real pair or
-        # fake pair
-        d_head = self.make_det_enc("discriminator_head")
+        # discriminator encoder-decoder pipeline
+        d_head_encs = dict(
+                (i, self.make_det_enc("discriminator_head_{}".format(i)))
+                for i in d_input_streams)
         d_enc = self.make_enc("discriminator_enc")
         d_dec = self.make_dec("discriminator_dec")
-        d_tail = self.make_det_dec("discriminator_tail")
+        d_tail_decs = dict(
+                (i, self.make_det_dec("discriminator_tail_{}".format(i)))
+                for i in d_output_streams)
 
-        # adversarial loss for g
-        g_adversarial_weight = 0.01
-        g_loss_adversarial = 0.0
-        for i, j in np.argwhere(cross_streams):
-            # only for translation streams
+        ## g training
+        g_inputs = [tf.placeholder(tf.float32, shape = (None,) + self.img_shape) for i in range(n_domains)]
+        
+        # autoencoding
+        g_ae_loss = 0.0
+        for i, j in np.argwhere(g_auto_streams):
+            assert(i == j)
             rec, rec_loss, lat_loss = ae_pipeline(
-                    recs[(i,j)], recs[(i,j)],
-                    d_head, d_enc, d_dec, d_tail)
-            g_loss_adversarial += rec_loss
-        g_loss_adversarial = g_loss_adversarial / np.argwhere(cross_streams).shape[0]
-        g_loss += g_adversarial_weight * g_loss_adversarial
+                    g_inputs[i], g_inputs[j],
+                    g_head_encs[i], g_enc, g_dec, g_tail_decs[j])
+            g_ae_loss += rec_loss + lat_weight*lat_loss
+            self.img_ops["g_{}_{}".format(i,j)] = rec
+            self.log_ops["g_ae_rec_loss_{}_{}".format(i,j)] = rec_loss
+        g_ae_loss = g_ae_loss / np.argwhere(g_auto_streams).shape[0]
+        self.log_ops["g_ae_loss"] = g_ae_loss
+
+        # adversarial translation
+        g_ad_loss = 0.0
+        g_su_loss = 0.0
+        for i, j in np.argwhere(g_cross_streams):
+            assert(i != j)
+            # translate
+            rec, rec_loss, lat_loss = ae_pipeline(
+                    g_inputs[i], g_inputs[j],
+                    g_head_encs[i], g_enc, g_dec, g_tail_decs[j])
+            # translate back via discriminator
+            recrec, recrec_loss, _ = ae_pipeline(
+                    rec, g_inputs[i],
+                    d_head_encs[j], d_enc, d_dec, d_tail_decs[i])
+            # adversarial loss derived from discriminator's reconstruction
+            # but own latent loss
+            g_ad_loss += recrec_loss + lat_weight*lat_loss
+            g_su_loss += rec_loss + lat_weight*lat_loss
+        g_ad_loss = g_ad_loss / np.argwhere(g_cross_streams).shape[0]
+        g_su_loss = g_su_loss / np.argwhere(g_cross_streams).shape[0]
+        self.log_ops["g_ad_loss"] = g_ad_loss
+        self.log_ops["g_su_loss"] = g_su_loss
+
+        # g total loss
+        g_loss = g_ae_loss + d_control * g_ad_loss + (1.0 - d_control) * g_su_loss
+        self.log_ops["g_loss"] = g_loss
+
+
+        ## d training - must be paired
+        d_inputs_pos = [tf.placeholder(tf.float32, shape = (None,) + self.img_shape) for i in range(n_domains)]
+        d_inputs_neg = [tf.placeholder(tf.float32, shape = (None,) + self.img_shape) for i in range(n_domains)]
+
+        # autoencoding
+        d_ae_loss = 0.0
+        for i, j, in np.argwhere(d_auto_streams):
+            assert(i == j)
+            rec, rec_loss, lat_loss = ae_pipeline(
+                    d_inputs_pos[i], d_inputs_pos[j],
+                    d_head_encs[i], d_enc, d_dec, d_tail_decs[j])
+            d_ae_loss += rec_loss + lat_weight*lat_loss
+            self.img_ops["d_pos_{}_{}".format(i,j)] = rec
+            self.log_ops["d_ae_pos_rec_loss_{}_{}".format(i,j)] = rec_loss
+        d_ae_loss = d_ae_loss / np.argwhere(d_auto_streams).shape[0]
+        self.log_ops["d_ae_loss"] = d_ae_loss
+
+        # energy of positive samples - must be paired
+        d_pos_loss = 0.0
+        for i, j in np.argwhere(g_cross_streams):
+            assert(i != j)
+            # translate back
+            recrec, recrec_loss, recrec_lat_loss = ae_pipeline(
+                    d_inputs_pos[j], d_inputs_neg[i],
+                    d_head_encs[j], d_enc, d_dec, d_tail_decs[i])
+            d_pos_loss += recrec_loss + lat_weight*recrec_lat_loss
+            self.img_ops["d_pos_{}_{}".format(i,j)] = recrec
+            self.log_ops["d_ae_pos_rec_loss_{}_{}".format(i,j)] = recrec_loss
+        d_pos_loss = d_pos_loss / np.argwhere(g_cross_streams).shape[0]
+        self.log_ops["d_pos_loss"] = d_pos_loss
+
+        # energy of negative samples - must be paired
+        d_neg_loss = 0.0
+        for i, j in np.argwhere(g_cross_streams):
+            # translate via generator
+            rec, _, _ = ae_pipeline(
+                    d_inputs_neg[i], d_inputs_neg[j],
+                    g_head_encs[i], g_enc, g_dec, g_tail_decs[j])
+            # translate back
+            recrec, recrec_loss, recrec_lat_loss = ae_pipeline(
+                    rec, d_inputs_neg[i],
+                    d_head_encs[j], d_enc, d_dec, d_tail_decs[i])
+            d_neg_loss += recrec_loss + lat_weight*recrec_lat_loss
+            self.img_ops["g_{}_{}".format(i,j)] = rec
+            self.img_ops["d_{}_{}".format(i,j)] = recrec
+            self.log_ops["d_ae_neg_rec_loss_{}_{}".format(i,j)] = recrec_loss
+        d_neg_loss = d_neg_loss / np.argwhere(g_cross_streams).shape[0]
+        self.log_ops["d_neg_loss"] = d_neg_loss
+
+        # d total loss
+        d_loss = d_ae_loss + d_pos_loss - d_control * d_neg_loss
+        self.log_ops["d_loss"] = d_loss
+
+
+        # visualize latent space (only for active output streams)
+        #n_samples = 64
+        #samples = dict()
+        #for out_stream in output_streams:
+        #    samples[out_stream] = sample_pipeline(n_samples, shared_dec, tail_decs[out_stream])
 
         # generator training
-        g_trainable_weights = shared_enc.trainable_weights + shared_dec.trainable_weights
-        for i in input_streams:
-            g_trainable_weights += head_encs[i].trainable_weights
-        for i in output_streams:
-            g_trainable_weights += tail_decs[i].trainable_weights
+        g_trainable_weights = g_enc.trainable_weights + g_dec.trainable_weights
+        for i in g_input_streams:
+            g_trainable_weights += g_head_encs[i].trainable_weights
+        for i in g_output_streams:
+            g_trainable_weights += g_tail_decs[i].trainable_weights
         g_optimizer = tf.train.AdamOptimizer(
                 learning_rate = self.lr, beta1 = 0.5, beta2 = 0.9)
         g_train = g_optimizer.minimize(g_loss, var_list = g_trainable_weights, global_step = global_step)
 
 
-        d_recs = dict()
-        # positive discriminator samples
-        d_train_pos_inputs = [tf.placeholder(tf.float32, shape = (None,) + self.img_shape) for i in range(n_domains)]
-        d_loss = 0.0
-        d_loss_pos = 0.0
-        for i in output_streams:
-            rec, rec_loss, lat_loss = ae_pipeline(
-                    d_train_pos_inputs[i], d_train_pos_inputs[i],
-                    d_head, d_enc, d_dec, d_tail)
-            d_loss_pos += rec_loss + lat_loss
-            d_recs[i] = rec
-        d_loss_pos = d_loss_pos / len(output_streams)
-        d_loss += d_loss_pos
-
-        # negative discriminator samples
-        # need new independent samples to produce fake images as negative
-        # samples - could be good to have domain samples independent too
-        d_train_neg_inputs = [tf.placeholder(tf.float32, shape = (None,) + self.img_shape) for i in range(n_domains)]
-        d_loss_neg = 0.0
-        for i, j in np.argwhere(cross_streams):
-            d_train_rec, _, _ = ae_pipeline(
-                    d_train_neg_inputs[i], d_train_neg_inputs[j],
-                    head_encs[i], shared_enc, shared_dec, tail_decs[j])
-            rec, rec_loss, lat_loss = ae_pipeline(
-                    d_train_rec, d_train_rec,
-                    d_head, d_enc, d_dec, d_tail)
-            d_loss_neg += rec_loss + lat_loss
-            d_recs[(i,j)] = rec
-        d_loss_neg = d_loss_neg / np.argwhere(cross_streams).shape[0]
-        d_loss -= d_control * d_loss_neg
-
         # discriminator training
-        d_trainable_weights = (
-                d_head.trainable_weights +
-                d_enc.trainable_weights +
-                d_dec.trainable_weights +
-                d_tail.trainable_weights)
+        d_trainable_weights = d_enc.trainable_weights + d_dec.trainable_weights
+        for i in d_input_streams:
+            d_trainable_weights += d_head_encs[i].trainable_weights
+        for i in d_output_streams:
+            d_trainable_weights += d_tail_decs[i].trainable_weights
         d_optimizer = tf.train.AdamOptimizer(
                 learning_rate = self.lr, beta1 = 0.5, beta2 = 0.9)
         d_train = d_optimizer.minimize(d_loss, var_list = d_trainable_weights)
@@ -545,46 +617,27 @@ class Model(object):
         # discriminator control training
         # ratio of loss(generator) / loss(discriminator)
         target_ratio = 0.6
-        control_value = target_ratio * d_loss_pos - d_loss_neg
+        control_value = target_ratio * d_pos_loss - d_neg_loss
         update_d_control = tf.assign(
                 d_control,
                 tf.clip_by_value(d_control + 1e-3 * control_value, 0, 1))
+        self.log_ops["control_value"] = control_value
 
         # convergence measure
-        convergence_measure = d_loss_pos + tf.abs(control_value)
+        convergence_measure = d_pos_loss + tf.abs(control_value)
+        self.log_ops["convergence_measure"] = convergence_measure
 
         # ops
         self.inputs = {
-                "g": inputs,
-                "d_positive": d_train_pos_inputs,
-                "d_negative": d_train_neg_inputs}
+                "g_inputs": g_inputs,
+                "d_inputs_pos": d_inputs_pos,
+                "d_inputs_neg": d_inputs_neg}
         self.train_ops = {
-                "g": g_train,
-                "d": d_train,
+                "g_train": g_train,
+                "d_train": d_train,
                 "d_control": update_d_control}
-        self.log_ops = {
-                "g_loss": g_loss,
-                "g_loss_adversarial": g_loss_adversarial,
-                "d_loss": d_loss,
-                "d_loss_pos": d_loss_pos,
-                "d_loss_neg": d_loss_neg,
-                "d_control": d_control,
-                "convergence_measure": convergence_measure,
-                "global_step": global_step}
-        self.img_ops = {}
-        for i in range(n_domains):
-            self.img_ops["input_{}".format(i)] = inputs[i]
-        for i, j in np.argwhere(streams):
-            self.log_ops["rec_loss_{}_{}".format(i,j)] = rec_losses[(i,j)]
-            self.log_ops["lat_loss_{}_{}".format(i,j)] = lat_losses[(i,j)]
-            self.img_ops["rec_{}_{}".format(i,j)] = recs[(i,j)]
-        for i, j in np.argwhere(cross_streams):
-            self.img_ops["d_rec_{}_{}".format(i,j)] = d_recs[(i,j)]
-        for i in output_streams:
-            self.img_ops["d_rec_{}".format(i)] = d_recs[i]
-        for i, sample in samples.items():
-            self.img_ops["sample_{}".format(i)] = sample
-
+        self.log_ops["d_control"] = d_control
+        self.log_ops["global_step"] = global_step
 
         for k, v in self.log_ops.items():
             tf.summary.scalar(k, v)
@@ -621,19 +674,16 @@ class Model(object):
     def fit(self, batches, valid_batches = None):
         self.valid_batches = valid_batches
         for batch in trange(self.n_total_steps):
-            X_batch, Y_batch = next(batches)
             X1_batch, Y1_batch = next(batches)
             X2_batch, Y2_batch = next(batches)
-
-            X_pos_batch, Y_pos_batch = X1_batch, Y2_batch
-            X_neg_batch, Y_neg_batch = X2_batch, Y1_batch
+            (X_pos_batch, Y_pos_batch), (X_neg_batch, Y_neg_batch) = split_batch([X2_batch, Y2_batch])
             feed_dict = {
-                    self.inputs["g"][0]: X_batch,
-                    self.inputs["g"][1]: Y_batch,
-                    self.inputs["d_positive"][0]: X_pos_batch,
-                    self.inputs["d_positive"][1]: Y_pos_batch,
-                    self.inputs["d_negative"][0]: X_neg_batch,
-                    self.inputs["d_negative"][1]: Y_neg_batch}
+                    self.inputs["g_inputs"][0]: X1_batch,
+                    self.inputs["g_inputs"][1]: Y1_batch,
+                    self.inputs["d_inputs_pos"][0]: X_pos_batch,
+                    self.inputs["d_inputs_pos"][1]: Y_pos_batch,
+                    self.inputs["d_inputs_neg"][0]: X_neg_batch,
+                    self.inputs["d_inputs_neg"][1]: Y_neg_batch}
             fetch_dict = {"train": self.train_ops}
             if self.log_ops["global_step"].eval(session) % self.log_frequency == 0:
                 fetch_dict["log"] = self.log_ops
@@ -658,14 +708,17 @@ class Model(object):
                 plot_images(v, k + "_{:07}".format(global_step))
             if self.valid_batches is not None:
                 # validation samples
-                batch = next(self.valid_batches)
+                X1_batch, Y1_batch = next(self.valid_batches)
+                X2_batch, Y2_batch = next(self.valid_batches)
+                (X_pos_batch, Y_pos_batch), (X_neg_batch, Y_neg_batch) = split_batch([X2_batch, Y2_batch])
                 feed_dict = {
-                        self.inputs["g"][0]: batch[0],
-                        self.inputs["g"][1]: batch[1]}
-                fetch_dict = dict()
-                for k, v in self.img_ops.items():
-                    if not k.startswith("d_"):
-                        fetch_dict[k] = v
+                        self.inputs["g_inputs"][0]: X1_batch,
+                        self.inputs["g_inputs"][1]: Y1_batch,
+                        self.inputs["d_inputs_pos"][0]: X_pos_batch,
+                        self.inputs["d_inputs_pos"][1]: Y_pos_batch,
+                        self.inputs["d_inputs_neg"][0]: X_neg_batch,
+                        self.inputs["d_inputs_neg"][1]: Y_neg_batch}
+                fetch_dict = self.img_ops
                 imgs = session.run(fetch_dict, feed_dict)
                 for k, v in imgs.items():
                     plot_images(v, "valid_" + k + "_{:07}".format(global_step))
