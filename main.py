@@ -419,22 +419,22 @@ class Model(object):
 
     def make_det_enc(self, name):
         return make_model(name, make_det_enc,
-                power_features = 6, n_layers = 2)
+                power_features = 6, n_layers = 1)
 
 
     def make_det_dec(self, name):
         return make_model(name, make_det_dec,
-                power_features = 6, n_layers = 2)
+                power_features = 6, n_layers = 1)
 
 
     def make_enc(self, name):
         return make_model(name, make_enc,
-                power_features = 8, n_layers = 3)
+                power_features = 7, n_layers = 4)
 
 
     def make_dec(self, name):
         return make_model(name, make_dec,
-                power_features = 8, n_layers = 3)
+                power_features = 7, n_layers = 4)
 
 
     def define_graph(self):
@@ -452,7 +452,10 @@ class Model(object):
         # adjacency matrix of active streams with (i,j) indicating stream
         # from domain i to domain j
         g_streams = np.zeros((n_domains, n_domains), dtype = np.bool)
+        g_streams[0,0] = True
+        g_streams[0,1] = True
         g_streams[1,0] = True
+        g_streams[1,1] = True
         g_auto_streams = g_streams & (np.eye(n_domains, dtype = np.bool))
         g_cross_streams = g_streams & (~np.eye(n_domains, dtype = np.bool))
         g_output_streams = np.nonzero(np.any(g_streams, axis = 0))[0]
