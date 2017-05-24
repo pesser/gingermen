@@ -443,7 +443,7 @@ class Model(object):
         self.lr = 1e-4
         self.n_total_steps = n_total_steps
         self.log_frequency = 50
-        self.save_frequency = 500
+        self.best_loss = float("inf")
         self.define_graph()
         self.restore_path = restore_path
         self.checkpoint_dir = os.path.join(out_dir, "checkpoints")
@@ -548,6 +548,10 @@ class Model(object):
         g_loss = g_ae_loss + g_su_loss
         self.log_ops["g_loss"] = g_loss
 
+        # overall loss used for checkpointing
+        loss = g_loss
+        self.log_ops["loss"] = loss
+
         # visualize latent space (only for active output streams)
         #n_samples = 64
         #samples = dict()
@@ -606,8 +610,6 @@ class Model(object):
             self.writer.flush()
         if "log" in result:
             for k, v in result["log"].items():
-                if type(v) == float:
-                    v = "{:.4e}".format(v)
                 logging.info("{}: {}".format(k, v))
         if "img" in result:
             for k, v in result["img"].items():
@@ -618,19 +620,29 @@ class Model(object):
                 feed_dict = {
                         self.inputs["g_inputs"][0]: X1_batch,
                         self.inputs["g_inputs"][1]: Y1_batch}
-                fetch_dict = self.img_ops
-                imgs = session.run(fetch_dict, feed_dict)
+                fetch_dict = dict()
+                fetch_dict["imgs"] = self.img_ops
+                # validation loss
+                fetch_dict["validation_loss"] = self.log_ops["loss"]
+                result = session.run(fetch_dict, feed_dict)
+                # display samples
+                imgs = result["imgs"]
                 for k, v in imgs.items():
                     plot_images(v, "valid_" + k + "_{:07}".format(global_step))
-        if global_step % self.save_frequency == self.save_frequency - 1:
-            fname = os.path.join(self.checkpoint_dir, "model.ckpt")
-            self.saver.save(
-                    session,
-                    fname,
-                    global_step = global_step)
-            logging.info("Saved model to {}".format(fname))
+                # checkpoint if validation loss improved
+                validation_loss = result["validation_loss"]
+                if validation_loss < self.best_loss:
+                    self.best_loss = validation_loss
+                    self.make_checkpoint(global_step)
 
 
+    def make_checkpoint(self, global_step):
+        fname = os.path.join(self.checkpoint_dir, "model.ckpt")
+        self.saver.save(
+                session,
+                fname,
+                global_step = global_step)
+        logging.info("Saved model to {}".format(fname))
 
 
 if __name__ == "__main__":
