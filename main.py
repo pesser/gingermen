@@ -230,7 +230,37 @@ def tf_normalize(x):
             momentum = 0.9)
 
 
-def ae_pipeline(input_, target, head_enc, enc, dec, tail_dec, loss = "l2"):
+smoothing1d = np.float32([1,2,1])
+difference1d = np.float32([1,0,-1])
+sobelx = np.outer(smoothing1d, difference1d)
+sobely = np.transpose(sobelx)
+# one dim for number of input channels
+sobelx = sobelx[:,:,None]
+sobely = sobely[:,:,None]
+# stack along new dim for output channels
+sobel = np.stack([sobelx, sobely], axis = -1)
+def tf_img_grad(x):
+    gray = tf.reduce_mean(x, axis = -1, keep_dims = True)
+    grad = tf.nn.conv2d(
+            input = gray,
+            filter = sobel,
+            strides = 4*[1],
+            padding = "SAME")
+    return grad
+
+
+def tf_grad_loss(x, y):
+    gx = tf_img_grad(x)
+    gy = tf_img_grad(y)
+    return tf.reduce_mean(tf.contrib.layers.flatten(tf.square(gx - gy)))
+
+
+def tf_grad_mag(x):
+    gx = tf_img_grad(x)
+    return tf.sqrt(tf.reduce_sum(tf.square(gx), axis = -1, keep_dims = True))
+
+
+def ae_pipeline(input_, target, head_enc, enc, dec, tail_dec, loss = "h1"):
     head_encoding = head_enc(input_)
 
     enc_encodings = enc(head_encoding)
@@ -246,6 +276,10 @@ def ae_pipeline(input_, target, head_enc, enc, dec, tail_dec, loss = "l2"):
     elif loss == "l1":
         rec_loss = tf.reduce_mean(tf.contrib.layers.flatten(
             tf.abs(target - tail_decoding)))
+    elif loss == "h1":
+        rec_loss = tf.reduce_mean(tf.contrib.layers.flatten(
+            tf.square(target - tail_decoding)))
+        rec_loss += tf_grad_loss(target, tail_decoding)
     else:
         raise NotImplemented("Unknown loss function: {}".format(loss))
 
@@ -474,7 +508,10 @@ class Model(object):
         ## g training
         g_inputs = [tf.placeholder(tf.float32, shape = (None,) + self.img_shape) for i in range(n_domains)]
         self.inputs["g_inputs"] = g_inputs
-        
+        for i in range(len(g_inputs)):
+            self.img_ops["g_inputs_{}".format(i)] = g_inputs[i]
+            self.img_ops["g_inputs_{}_edges".format(i)] = tf_grad_mag(g_inputs[i])
+
         # autoencoding
         g_ae_loss = tf.to_float(0.0)
         for i, j in np.argwhere(g_auto_streams):
@@ -487,6 +524,7 @@ class Model(object):
                     g_head_encs[i], g_enc, g_dec, g_tail_decs[j])
             g_ae_loss += (rec_loss + lat_weight*lat_loss) / n
             self.img_ops["g_{}_{}".format(i,j)] = rec
+            self.img_ops["g_{}_{}_edges".format(i,j)] = tf_grad_mag(rec)
             self.log_ops["g_ae_loss_rec_{}_{}".format(i,j)] = rec_loss
         self.log_ops["g_ae_loss"] = g_ae_loss
 
@@ -502,6 +540,7 @@ class Model(object):
                     g_head_encs[i], g_enc, g_dec, g_tail_decs[j])
             g_su_loss += (rec_loss + lat_weight*lat_loss)/n
             self.img_ops["g_su_{}_{}".format(i,j)] = rec
+            self.img_ops["g_su_{}_{}_edges".format(i,j)] = tf_grad_mag(rec)
             self.log_ops["g_su_loss_rec_{}_{}".format(i,j)] = rec_loss
         self.log_ops["g_su_loss"] = g_su_loss
 
