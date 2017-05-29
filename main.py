@@ -260,16 +260,26 @@ def tf_grad_mag(x):
     return tf.sqrt(tf.reduce_sum(tf.square(gx), axis = -1, keep_dims = True))
 
 
-def ae_pipeline(input_, target, head_enc, enc, dec, tail_dec, loss = "h1"):
+def ae_infer_z(input_, head_enc, enc, sample):
+    """Sample latent variable conditioned on input.
+    If sample is True, sample and return kl loss,
+    else return mean and return zero kl loss."""
     head_encoding = head_enc(input_)
 
     enc_encodings = enc(head_encoding)
-    enc_encodings_z, enc_lat_loss = ae_sampling(enc_encodings)
+    enc_encodings_z, enc_lat_loss = ae_sampling(enc_encodings, sample = sample)
 
-    decoding = dec(enc_encodings_z)
+    return enc_encodings_z, enc_lat_loss
+
+
+def ae_infer_x(input_, dec, tail_dec):
+    """Infer mean x conditioned on latent input."""
+    decoding = dec(input_)
     tail_decoding = tail_dec(decoding)
+    return tail_decoding
 
-    lat_loss = enc_lat_loss
+
+def ae_likelihood(target, tail_decoding, loss = "h1"):
     if loss == "l2":
         rec_loss = tf.reduce_mean(tf.contrib.layers.flatten(
             tf.square(target - tail_decoding)))
@@ -282,6 +292,14 @@ def ae_pipeline(input_, target, head_enc, enc, dec, tail_dec, loss = "h1"):
         rec_loss += tf_grad_loss(target, tail_decoding)
     else:
         raise NotImplemented("Unknown loss function: {}".format(loss))
+    return rec_loss
+
+
+def ae_pipeline(input_, target, head_enc, enc, dec, tail_dec, sample, loss = "h1"):
+    enc_encodings_z, enc_lat_loss = ae_infer_z(input_, head_enc, enc, sample)
+    tail_decoding = ae_infer_x(enc_encodings_z, dec, tail_dec)
+    lat_loss = enc_lat_loss
+    rec_loss = ae_likelihood(target, tail_decoding, loss = loss)
 
     return tail_decoding, rec_loss, lat_loss
 
@@ -297,17 +315,20 @@ def sample_pipeline(n_samples, dec, det_dec):
     return tail_decoding
 
 
-def ae_sampling(encodings):
+def ae_sampling(encodings, sample = False):
     means, vars_ = encodings[:len(encodings)//2], encodings[len(encodings)//2:]
-    kl = 0.0
+    kl = tf.to_float(0.0)
     zs = []
     for mean, var in zip(means, vars_):
-        z_shape = tf.shape(mean)
-        eps = tf.random_normal(z_shape, mean = 0.0, stddev = 1.0)
-        z = mean + tf.sqrt(var) * eps
+        if sample:
+            z_shape = tf.shape(mean)
+            eps = tf.random_normal(z_shape, mean = 0.0, stddev = 1.0)
+            z = mean + tf.sqrt(var) * eps
+            kl += 0.5 * tf.reduce_mean(tf.contrib.layers.flatten(
+                tf.square(mean) + var - tf.log(var) - 1.0))
+        else:
+            z = mean
         zs.append(z)
-        kl += 0.5 * tf.reduce_mean(tf.contrib.layers.flatten(
-            tf.square(mean) + var - tf.log(var) - 1.0))
     kl = kl / float(len(means))
     return zs, kl
 
@@ -343,6 +364,16 @@ def make_model(name, run, **kwargs):
     return TFModel(name, runl)
 
 
+def residual_block(input_):
+    n_features = input_.get_shape().as_list()[-1]
+    residual = input_
+    for i in range(2):
+        residual = tf_normalize(residual)
+        residual = tf_activate(residual, "leakyrelu")
+        residual = tf_conv(residual, 3, n_features)
+    return input_ + residual
+
+
 def make_enc(input_, power_features, n_layers):
     """Stochastic ladder encoder."""
     # ops
@@ -356,18 +387,23 @@ def make_enc(input_, power_features, n_layers):
     vars_ = []
 
     pf = power_features
+    maxf = 512
+    nblocks = 0
 
     features = input_
     for i in range(n_layers):
-        mean = conv_op(features, 1, 2**(pf+i), stride = 1)
-        var_ = conv_op(features, 1, 2**(pf+i), stride = 1)
+        n_features = max(maxf, 2**(pf+i))
+        mean = conv_op(features, 1, n_features, stride = 1)
+        var_ = conv_op(features, 1, n_features, stride = 1)
         var_ = soft_op(var_)
         means.append(mean)
         vars_.append(var_)
         if i + 1 < n_layers:
-            features = conv_op(features, 5, 2**(pf+i), stride = 2)
+            features = conv_op(features, 5, n_features, stride = 2)
             features = norm_op(features)
             features = acti_op(features)
+            for j in range(nblocks):
+                features = residual_block(features)
 
     return means + vars_
 
@@ -381,14 +417,31 @@ def make_dec(inputs, power_features, n_layers):
     acti_op = lambda x: tf_activate(x, "leakyrelu")
 
     pf = power_features
+    maxf = 512
+    nblocks = 0
+
+    # get z to right shape
+    inputs = list(inputs)
+    z_style = inputs.pop(0)
+    style_spatial_size = z_style.get_shape().as_list()[1]
+    style_feature_size = z_style.get_shape().as_list()[-1]
+    pose_spatial_size = inputs[-1].get_shape().as_list()[1]
+    n_upsamplings = int(np.log2(pose_spatial_size/style_spatial_size))
+    for i in range(n_upsamplings):
+        z_style = conv_op(z_style, 3, style_feature_size, stride = 2)
+        z_style = norm_op(z_style)
+        z_style = acti_op(z_style)
 
     # build top down
     for l in reversed(range(n_layers)):
+        n_features = max(maxf, 2**(pf+l))
         if l == n_layers - 1:
-            features = inputs[l]
+            features = conc_op([z_style, inputs[l]])
         else:
             features = conc_op([features, inputs[l]])
-        features = conv_op(features, 5, 2**(pf+l), stride = 2)
+        for j in range(nblocks):
+            features = residual_block(features)
+        features = conv_op(features, 5, n_features, stride = 2)
         features = norm_op(features)
         features = acti_op(features)
 
@@ -403,12 +456,17 @@ def make_det_enc(input_, power_features, n_layers):
     acti_op = lambda x: tf_activate(x, "leakyrelu")
 
     pf = power_features
+    maxf = 512
+    nblocks = 0
 
     features = input_
     for i in range(n_layers):
-        features = conv_op(features, 5, 2**(pf+i), stride = 2)
+        n_features = max(maxf, 2**(pf+i))
+        features = conv_op(features, 5, n_features, stride = 2)
         features = norm_op(features)
         features = acti_op(features)
+        for j in range(nblocks):
+            features = residual_block(features)
 
     return features
 
@@ -423,12 +481,17 @@ def make_det_dec(input_, power_features, n_layers, out_channels = 3):
     tanh_op = lambda x: tf_activate(x, "tanh")
 
     pf = power_features
+    maxf = 512
+    nblocks = 0
 
     # build top down
     features = input_
     for l in reversed(range(n_layers)):
+        n_features = max(maxf, 2**(pf+l-1))
+        for j in range(nblocks):
+            features = residual_block(features)
         if l > 0:
-            features = conv_op(features, 5, 2**(pf+l-1), stride = 2)
+            features = conv_op(features, 5, n_features, stride = 2)
             features = norm_op(features)
             features = acti_op(features)
     output = conv_op(features, 5, out_channels, stride = 1)
@@ -442,7 +505,7 @@ class Model(object):
         self.img_shape = img_shape
         self.lr = 1e-4
         self.n_total_steps = n_total_steps
-        self.log_frequency = 50
+        self.log_frequency = 100
         self.best_loss = float("inf")
         self.define_graph()
         self.restore_path = restore_path
@@ -463,12 +526,22 @@ class Model(object):
 
     def make_enc(self, name):
         return make_model(name, make_enc,
-                power_features = 7, n_layers = 4)
+                power_features = 7, n_layers = 2)
 
 
     def make_dec(self, name):
         return make_model(name, make_dec,
-                power_features = 7, n_layers = 4)
+                power_features = 7, n_layers = 2)
+
+
+    def make_style_det_enc(self, name):
+        return make_model(name, make_det_enc,
+                power_features = 5, n_layers = 3)
+
+
+    def make_style_enc(self, name):
+        return make_model(name, make_enc,
+                power_features = 8, n_layers = 1)
 
 
     def define_graph(self):
@@ -476,6 +549,8 @@ class Model(object):
         self.train_ops = {}
         self.log_ops = {}
         self.img_ops = {}
+        self.test_inputs = {}
+        self.test_outputs = {}
 
         global_step = tf.Variable(0, trainable = False, name = "global_step")
         self.log_ops["global_step"] = global_step
@@ -486,10 +561,10 @@ class Model(object):
         # adjacency matrix of active streams with (i,j) indicating stream
         # from domain i to domain j
         g_streams = np.zeros((n_domains, n_domains), dtype = np.bool)
-        g_streams[0,0] = True
-        g_streams[0,1] = True
+        #g_streams[0,0] = True
+        #g_streams[0,1] = True
         g_streams[1,0] = True
-        g_streams[1,1] = True
+        #g_streams[1,1] = True
         g_auto_streams = g_streams & (np.eye(n_domains, dtype = np.bool))
         g_cross_streams = g_streams & (~np.eye(n_domains, dtype = np.bool))
         g_output_streams = np.nonzero(np.any(g_streams, axis = 0))[0]
@@ -505,6 +580,9 @@ class Model(object):
                 (i, self.make_det_dec("generator_tail_{}".format(i)))
                 for i in g_output_streams)
 
+        g_head_style_enc = self.make_style_det_enc("generator_head_style_enc")
+        g_style_enc = self.make_style_enc("generator_style_enc")
+
         ## g training
         g_inputs = [tf.placeholder(tf.float32, shape = (None,) + self.img_shape) for i in range(n_domains)]
         self.inputs["g_inputs"] = g_inputs
@@ -518,13 +596,17 @@ class Model(object):
             assert(i == j)
             n = np.argwhere(g_auto_streams).shape[0]
 
-            # reconstruct
-            rec, rec_loss, lat_loss = ae_pipeline(
-                    g_inputs[i], g_inputs[j],
-                    g_head_encs[i], g_enc, g_dec, g_tail_decs[j])
-            g_ae_loss += (rec_loss + lat_weight*lat_loss) / n
+            z_style, kl_style = ae_infer_z(g_inputs[i], g_head_style_enc, g_style_enc, sample = True)
+            z_pose, kl_pose = ae_infer_z(g_inputs[i], g_head_encs[i], g_enc, sample = False)
+            zs = z_style + z_pose
+            rec = ae_infer_x(zs, g_dec, g_tail_decs[j])
+
+            lat_loss = kl_style + kl_pose
+            rec_loss = ae_likelihood(g_inputs[j], rec)
+
+            g_ae_loss += (rec_loss + lat_loss) / n
+
             self.img_ops["g_{}_{}".format(i,j)] = rec
-            self.img_ops["g_{}_{}_edges".format(i,j)] = tf_grad_mag(rec)
             self.log_ops["g_ae_loss_rec_{}_{}".format(i,j)] = rec_loss
         self.log_ops["g_ae_loss"] = g_ae_loss
 
@@ -534,14 +616,18 @@ class Model(object):
             assert(i != j)
             n = np.argwhere(g_cross_streams).shape[0]
 
-            # translate
-            rec, rec_loss, lat_loss = ae_pipeline(
-                    g_inputs[i], g_inputs[j],
-                    g_head_encs[i], g_enc, g_dec, g_tail_decs[j])
-            g_su_loss += (rec_loss + lat_weight*lat_loss)/n
+            z_style, kl_style = ae_infer_z(g_inputs[i], g_head_style_enc, g_style_enc, sample = True)
+            z_pose, kl_pose = ae_infer_z(g_inputs[i], g_head_encs[i], g_enc, sample = False)
+            zs = z_style + z_pose
+            rec = ae_infer_x(zs, g_dec, g_tail_decs[j])
+
+            lat_loss = kl_style + kl_pose
+            rec_loss = ae_likelihood(g_inputs[j], rec)
+
+            g_su_loss += (rec_loss + lat_loss)/n
             self.img_ops["g_su_{}_{}".format(i,j)] = rec
-            self.img_ops["g_su_{}_{}_edges".format(i,j)] = tf_grad_mag(rec)
             self.log_ops["g_su_loss_rec_{}_{}".format(i,j)] = rec_loss
+            self.log_ops["g_su_loss_lat_{}_{}".format(i,j)] = lat_loss
         self.log_ops["g_su_loss"] = g_su_loss
 
         # g total loss
@@ -557,9 +643,19 @@ class Model(object):
         #samples = dict()
         #for out_stream in output_streams:
         #    samples[out_stream] = sample_pipeline(n_samples, shared_dec, tail_decs[out_stream])
+        test_inputs = tf.placeholder(tf.float32, shape = (None,) + self.img_shape)
+        self.test_inputs = test_inputs
+        z_style_shape = z_style[0].get_shape().as_list()[1:]
+        batch_style_shape = [tf.shape(test_inputs)[0]] + z_style_shape
+        z_style = [tf.random_normal(batch_style_shape, mean = 0.0, stddev = 1.0)]
+        z_pose, _ = ae_infer_z(test_inputs, g_head_encs[1], g_enc, sample = False)
+        zs = z_style + z_pose
+        rec = ae_infer_x(zs, g_dec, g_tail_decs[0])
+        self.test_outputs = rec
 
         # generator training
         g_trainable_weights = g_enc.trainable_weights + g_dec.trainable_weights
+        g_trainable_weights += g_head_style_enc.trainable_weights + g_style_enc.trainable_weights
         for i in g_input_streams:
             g_trainable_weights += g_head_encs[i].trainable_weights
         for i in g_output_streams:
@@ -614,6 +710,7 @@ class Model(object):
         if "img" in result:
             for k, v in result["img"].items():
                 plot_images(v, k + "_{:07}".format(global_step))
+
             if self.valid_batches is not None:
                 # validation samples
                 X1_batch, Y1_batch = next(self.valid_batches)
@@ -631,9 +728,16 @@ class Model(object):
                     plot_images(v, "valid_" + k + "_{:07}".format(global_step))
                 # checkpoint if validation loss improved
                 validation_loss = result["validation_loss"]
+                logging.info("{}: {}".format("validation_loss", validation_loss))
                 if validation_loss < self.best_loss:
+                    logging.info("step {}: Validation loss improved from {:.4e} to {:.4e}".format(global_step, self.best_loss, validation_loss))
                     self.best_loss = validation_loss
                     self.make_checkpoint(global_step)
+            # testing
+            X_batch, Y_batch = next(self.valid_batches)
+            feed_dict = {self.test_inputs: Y_batch}
+            test_outputs = session.run(self.test_outputs, feed_dict)
+            plot_images(test_outputs, "testing_{:07}".format(global_step))
 
 
     def make_checkpoint(self, global_step):
