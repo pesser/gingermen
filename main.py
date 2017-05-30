@@ -374,8 +374,8 @@ def residual_block(input_):
     return input_ + residual
 
 
-def make_enc(input_, power_features, n_layers):
-    """Stochastic ladder encoder."""
+def make_u_enc(input_, n_layers):
+    """U-Encoder"""
     # ops
     conv_op = tf_conv
     soft_op = lambda x: tf_activate(x, "softplus")
@@ -383,121 +383,171 @@ def make_enc(input_, power_features, n_layers):
     acti_op = lambda x: tf_activate(x, "leakyrelu")
 
     # outputs
-    means = []
-    vars_ = []
+    zs = []
 
-    pf = power_features
+    pf = np.log2(input_.get_shape().as_list()[-1])
     maxf = 512
     nblocks = 2
 
     features = input_
     for i in range(n_layers):
-        n_features = min(maxf, 2**(pf+i))
-        mean = conv_op(features, 1, n_features, stride = 1)
-        var_ = conv_op(features, 1, n_features, stride = 1)
-        var_ = soft_op(var_)
-        means.append(mean)
-        vars_.append(var_)
+        n_features = features.get_shape().as_list()[-1]
+        zs.append(conv_op(features, 1, n_features, stride = 1))
         if i + 1 < n_layers:
+            n_features = min(maxf, 2**(pf+i+1))
             features = conv_op(features, 5, n_features, stride = 2)
             features = norm_op(features)
             features = acti_op(features)
             for j in range(nblocks):
                 features = residual_block(features)
 
-    return means + vars_
+    return zs
 
 
-def make_dec(inputs, power_features, n_layers):
-    """Stochastic ladder decoder."""
+def by_shape(inputs):
+    bs = dict()
+    for x in inputs:
+        shape = x.get_shape().as_list()[1]
+        if not shape in bs:
+            bs[shape] = list()
+        bs[shape].append(x)
+    return bs
+
+
+def make_u_dec(inputs):
+    """U-Decoder that takes arbitrary inputs (all with shape in power of
+    two) and concatenates them with successively upsampling decodings.
+    Output shape is determined by first input with maximum spatial shape."""
     # ops
     conv_op = tf_conv_transposed
     conc_op = tf_concatenate
     norm_op = tf_normalize
     acti_op = lambda x: tf_activate(x, "leakyrelu")
 
-    pf = power_features
+    in_by_shape = by_shape(inputs)
+    min_shape = min(in_by_shape.keys())
+    max_shape = max(in_by_shape.keys())
+    n_layers = int(np.log2(max_shape/min_shape))
+
+    pf = np.log2(in_by_shape[max_shape][0].get_shape().as_list()[-1])
     maxf = 512
     nblocks = 2
 
-    # get z to right shape
-    inputs = list(inputs)
-    z_style = inputs.pop(0)
-    style_spatial_size = z_style.get_shape().as_list()[1]
-    style_feature_size = z_style.get_shape().as_list()[-1]
-    pose_spatial_size = inputs[-1].get_shape().as_list()[1]
-    n_upsamplings = int(np.log2(pose_spatial_size/style_spatial_size))
-    for i in range(n_upsamplings):
-        z_style = conv_op(z_style, 3, style_feature_size, stride = 2)
-        z_style = norm_op(z_style)
-        z_style = acti_op(z_style)
-
+    print(in_by_shape)
+    fshapes = []
     # build top down
     for l in reversed(range(n_layers)):
-        n_features = min(maxf, 2**(pf+l))
         if l == n_layers - 1:
-            features = conc_op([z_style, inputs[l]])
+            features = conc_op(in_by_shape[min_shape])
         else:
-            features = conc_op([features, inputs[l]])
+            shape = features.get_shape().as_list()[1]
+            if shape in in_by_shape:
+                features = conc_op([features] + in_by_shape[shape])
         for j in range(nblocks):
             features = residual_block(features)
+        n_features = min(maxf, 2**(pf+l))
         features = conv_op(features, 5, n_features, stride = 2)
         features = norm_op(features)
         features = acti_op(features)
+        fshapes.append(features.get_shape().as_list())
+    print(fshapes)
 
     return features
 
 
-def make_det_enc(input_, power_features, n_layers):
-    """Deterministic encoder."""
+def make_enc(input_, power_features, n_layers):
+    """Encoder."""
     # ops
     conv_op = tf_conv
     norm_op = tf_normalize
     acti_op = lambda x: tf_activate(x, "leakyrelu")
 
-    pf = power_features
     maxf = 512
     nblocks = 2
 
+    n_features = min(maxf, 2**power_features)
     features = input_
+    features = conv_op(features, 3, n_features, stride = 1)
     for i in range(n_layers):
-        n_features = min(maxf, 2**(pf+i))
+        n_features = min(maxf, 2*n_features)
         features = conv_op(features, 5, n_features, stride = 2)
         features = norm_op(features)
         features = acti_op(features)
         for j in range(nblocks):
             features = residual_block(features)
+    print("enc out: {}".format(features.get_shape().as_list()))
 
     return features
 
 
-def make_det_dec(input_, power_features, n_layers, out_channels = 3):
-    """Deterministic decoder. Expects upsampled input."""
+def make_dec(input_, n_layers, out_channels = 3):
+    """Decoder."""
     # ops
     conv_op = tf_conv_transposed
-    conc_op = tf_concatenate
     norm_op = tf_normalize
     acti_op = lambda x: tf_activate(x, "leakyrelu")
     tanh_op = lambda x: tf_activate(x, "tanh")
 
-    pf = power_features
     maxf = 512
     nblocks = 2
 
     # build top down
+    n_features = input_.get_shape().as_list()[-1]
     features = input_
+    print("dec in: {}".format(features.get_shape().as_list()))
     for l in reversed(range(n_layers)):
-        n_features = min(maxf, 2**(pf+l-1))
         for j in range(nblocks):
             features = residual_block(features)
-        if l > 0:
-            features = conv_op(features, 5, n_features, stride = 2)
-            features = norm_op(features)
-            features = acti_op(features)
+        n_features = min(maxf, n_features // 2)
+        features = conv_op(features, 5, n_features, stride = 2)
+        features = norm_op(features)
+        features = acti_op(features)
+    for j in range(nblocks):
+        features = residual_block(features)
     output = conv_op(features, 5, out_channels, stride = 1)
     output = tanh_op(output)
 
     return output
+
+
+def make_style_enc(input_, power_features):
+    # ops
+    conv_op = tf_conv
+    norm_op = tf_normalize
+    acti_op = lambda x: tf_activate(x, "leakyrelu")
+
+    # outputs
+    means = []
+    vars_ = []
+
+    maxf = 512
+    nblocks = 2
+    n_layers = 3
+    latent_dim = 128
+
+    n_features = min(maxf, 2**power_features)
+    features = input_
+    features = conv_op(features, 3, n_features, stride = 1)
+    for i in range(n_layers):
+        n_features = min(maxf, 2*n_features)
+        features = conv_op(features, 5, n_features, stride = 2)
+        features = norm_op(features)
+        features = acti_op(features)
+        for j in range(nblocks):
+            features = residual_block(features)
+    features = tf.contrib.layers.flatten(features)
+    # reintroduce spatial shape
+    features = tf.expand_dims(features, axis = 1)
+    features = tf.expand_dims(features, axis = 1)
+    print("lat shape: {}".format(features.get_shape().as_list()))
+
+    mean = conv_op(features, 1, latent_dim, stride = 1)
+    var_ = conv_op(features, 1, latent_dim, stride = 1)
+    var_ = tf_activate(var_, "softplus")
+    means.append(mean)
+    vars_.append(var_)
+
+    return means + vars_
 
 
 class Model(object):
@@ -506,6 +556,7 @@ class Model(object):
         self.lr = 1e-4
         self.n_total_steps = n_total_steps
         self.log_frequency = 100
+        self.ckpt_frequency = 1500
         self.best_loss = float("inf")
         self.define_graph()
         self.restore_path = restore_path
@@ -514,34 +565,28 @@ class Model(object):
         self.init_graph()
 
 
-    def make_det_enc(self, name):
-        return make_model(name, make_det_enc,
-                power_features = 6, n_layers = 1)
-
-
-    def make_det_dec(self, name):
-        return make_model(name, make_det_dec,
-                power_features = 6, n_layers = 1)
-
-
     def make_enc(self, name):
         return make_model(name, make_enc,
-                power_features = 7, n_layers = 2)
+                power_features = 7, n_layers = 0)
 
 
     def make_dec(self, name):
         return make_model(name, make_dec,
-                power_features = 7, n_layers = 2)
+                n_layers = 0)
 
 
-    def make_style_det_enc(self, name):
-        return make_model(name, make_det_enc,
-                power_features = 5, n_layers = 6)
+    def make_u_enc(self, name):
+        return make_model(name, make_u_enc,
+                n_layers = 2)
+
+
+    def make_u_dec(self, name):
+        return make_model(name, make_u_dec)
 
 
     def make_style_enc(self, name):
-        return make_model(name, make_enc,
-                power_features = 11, n_layers = 1)
+        return make_model(name, make_style_enc,
+                power_features = 7)
 
 
     def define_graph(self):
@@ -558,18 +603,15 @@ class Model(object):
         n_domains = 2
         kl_weight = make_linear_var(
                 step = global_step,
-                start = 100, end = 2500,
+                start = 100, end = 1000,
                 start_value = 0.0, end_value = 1.0,
-                clip_min = 0.0, clip_max = 1.0)
+                clip_min = 1e-3, clip_max = 1.0)
         self.log_ops["kl_weight"] = kl_weight
 
         # adjacency matrix of active streams with (i,j) indicating stream
         # from domain i to domain j
         g_streams = np.zeros((n_domains, n_domains), dtype = np.bool)
-        #g_streams[0,0] = True
-        #g_streams[0,1] = True
         g_streams[1,0] = True
-        #g_streams[1,1] = True
         g_auto_streams = g_streams & (np.eye(n_domains, dtype = np.bool))
         g_cross_streams = g_streams & (~np.eye(n_domains, dtype = np.bool))
         g_output_streams = np.nonzero(np.any(g_streams, axis = 0))[0]
@@ -577,16 +619,17 @@ class Model(object):
 
         # generator encoder-decoder pipeline
         g_head_encs = dict(
-                (i, self.make_det_enc("generator_head_{}".format(i)))
+                (i, self.make_enc("generator_head_{}".format(i)))
                 for i in g_input_streams)
-        g_enc = self.make_enc("generator_enc")
-        g_dec = self.make_dec("generator_dec")
+        g_enc = self.make_u_enc("generator_enc")
+        g_dec = self.make_u_dec("generator_dec")
         g_tail_decs = dict(
-                (i, self.make_det_dec("generator_tail_{}".format(i)))
+                (i, self.make_dec("generator_tail_{}".format(i)))
                 for i in g_output_streams)
-
-        g_head_style_enc = self.make_style_det_enc("generator_head_style_enc")
         g_style_enc = self.make_style_enc("generator_style_enc")
+
+        #g_head_style_enc = self.make_style_det_enc("generator_head_style_enc")
+        #g_style_enc = self.make_style_enc("generator_style_enc")
 
         ## g training
         g_inputs = [tf.placeholder(tf.float32, shape = (None,) + self.img_shape) for i in range(n_domains)]
@@ -595,72 +638,56 @@ class Model(object):
             self.img_ops["g_inputs_{}".format(i)] = g_inputs[i]
             self.img_ops["g_inputs_{}_edges".format(i)] = tf_grad_mag(g_inputs[i])
 
-        # autoencoding
-        g_ae_loss = tf.to_float(0.0)
-        for i, j in np.argwhere(g_auto_streams):
-            assert(i == j)
-            n = np.argwhere(g_auto_streams).shape[0]
-
-            z_style, kl_style = ae_infer_z(g_inputs[j], g_head_style_enc, g_style_enc, sample = True)
-            z_pose, kl_pose = ae_infer_z(g_inputs[i], g_head_encs[i], g_enc, sample = False)
-            zs = z_style + z_pose
-            rec = ae_infer_x(zs, g_dec, g_tail_decs[j])
-
-            lat_loss = kl_style + kl_pose
-            rec_loss = ae_likelihood(g_inputs[j], rec)
-
-            g_ae_loss += (rec_loss + kl_weight*lat_loss) / n
-
-            self.img_ops["g_{}_{}".format(i,j)] = rec
-            self.log_ops["g_ae_loss_rec_{}_{}".format(i,j)] = rec_loss
-        self.log_ops["g_ae_loss"] = g_ae_loss
-
         # supervised translation
         g_su_loss = tf.to_float(0.0)
         for i, j in np.argwhere(g_cross_streams):
             assert(i != j)
             n = np.argwhere(g_cross_streams).shape[0]
 
-            z_style, kl_style = ae_infer_z(g_inputs[j], g_head_style_enc, g_style_enc, sample = True)
-            z_pose, kl_pose = ae_infer_z(g_inputs[i], g_head_encs[i], g_enc, sample = False)
-            zs = z_style + z_pose
-            rec = ae_infer_x(zs, g_dec, g_tail_decs[j])
+            input_ = g_inputs[i]
+            target = g_inputs[j]
 
-            lat_loss = kl_style + kl_pose
-            rec_loss = ae_likelihood(g_inputs[j], rec)
+            style_params = g_style_enc(target)
+            style_zs, style_kl = ae_sampling(style_params, sample = True)
 
-            g_su_loss += (rec_loss + kl_weight*lat_loss)/n
-            self.img_ops["g_su_{}_{}".format(i,j)] = rec
-            self.log_ops["g_su_loss_rec_{}_{}".format(i,j)] = rec_loss
+            pose_zs = g_enc(g_head_encs[i](input_))
+
+            zs = pose_zs + style_zs
+            dec = g_tail_decs[j](g_dec(zs))
+            dec_loss = ae_likelihood(target, dec, loss = "h1")
+
+            lat_loss = kl_weight*style_kl
+            g_su_loss += (dec_loss + lat_loss)/n
+            self.img_ops["g_su_{}_{}".format(i,j)] = dec
+            self.log_ops["g_su_loss_dec_{}_{}".format(i,j)] = dec_loss
             self.log_ops["g_su_loss_lat_{}_{}".format(i,j)] = lat_loss
         self.log_ops["g_su_loss"] = g_su_loss
 
         # g total loss
-        g_loss = g_ae_loss + g_su_loss
+        g_loss = g_su_loss
         self.log_ops["g_loss"] = g_loss
 
         # overall loss used for checkpointing
         loss = g_loss
         self.log_ops["loss"] = loss
 
-        # visualize latent space (only for active output streams)
-        #n_samples = 64
-        #samples = dict()
-        #for out_stream in output_streams:
-        #    samples[out_stream] = sample_pipeline(n_samples, shared_dec, tail_decs[out_stream])
+        # testing
         test_inputs = tf.placeholder(tf.float32, shape = (None,) + self.img_shape)
         self.test_inputs = test_inputs
-        z_style_shape = z_style[0].get_shape().as_list()[1:]
+
+        z_style_shape = style_zs[0].get_shape().as_list()[1:]
         batch_style_shape = [tf.shape(test_inputs)[0]] + z_style_shape
-        z_style = [tf.random_normal(batch_style_shape, mean = 0.0, stddev = 1.0)]
-        z_pose, _ = ae_infer_z(test_inputs, g_head_encs[1], g_enc, sample = False)
-        zs = z_style + z_pose
-        rec = ae_infer_x(zs, g_dec, g_tail_decs[0])
-        self.test_outputs = rec
+
+        style_zs = [tf.random_normal(batch_style_shape, mean = 0.0, stddev = 1.0)]
+        pose_zs = g_enc(g_head_encs[1](test_inputs))
+
+        zs = pose_zs + style_zs
+        dec = g_tail_decs[0](g_dec(zs))
+        self.test_outputs = dec
 
         # generator training
         g_trainable_weights = g_enc.trainable_weights + g_dec.trainable_weights
-        g_trainable_weights += g_head_style_enc.trainable_weights + g_style_enc.trainable_weights
+        g_trainable_weights += g_style_enc.trainable_weights
         for i in g_input_streams:
             g_trainable_weights += g_head_encs[i].trainable_weights
         for i in g_output_streams:
@@ -738,6 +765,8 @@ class Model(object):
                     logging.info("step {}: Validation loss improved from {:.4e} to {:.4e}".format(global_step, self.best_loss, validation_loss))
                     self.best_loss = validation_loss
                     self.make_checkpoint(global_step)
+                elif global_step % self.ckpt_frequency == 0:
+                    self.make_checkpoint(global_step)
             # testing
             X_batch, Y_batch = next(self.valid_batches)
             feed_dict = {self.test_inputs: Y_batch}
@@ -760,7 +789,7 @@ if __name__ == "__main__":
         restore_path = sys.argv[1]
 
     img_shape = (64, 64, 3)
-    batch_size = 64
+    batch_size = 32
 
     init_logging()
     batches = get_batches("train", img_shape, batch_size, ["x", "y"])
