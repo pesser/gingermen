@@ -388,11 +388,11 @@ def make_enc(input_, power_features, n_layers):
 
     pf = power_features
     maxf = 512
-    nblocks = 0
+    nblocks = 2
 
     features = input_
     for i in range(n_layers):
-        n_features = max(maxf, 2**(pf+i))
+        n_features = min(maxf, 2**(pf+i))
         mean = conv_op(features, 1, n_features, stride = 1)
         var_ = conv_op(features, 1, n_features, stride = 1)
         var_ = soft_op(var_)
@@ -418,7 +418,7 @@ def make_dec(inputs, power_features, n_layers):
 
     pf = power_features
     maxf = 512
-    nblocks = 0
+    nblocks = 2
 
     # get z to right shape
     inputs = list(inputs)
@@ -434,7 +434,7 @@ def make_dec(inputs, power_features, n_layers):
 
     # build top down
     for l in reversed(range(n_layers)):
-        n_features = max(maxf, 2**(pf+l))
+        n_features = min(maxf, 2**(pf+l))
         if l == n_layers - 1:
             features = conc_op([z_style, inputs[l]])
         else:
@@ -457,11 +457,11 @@ def make_det_enc(input_, power_features, n_layers):
 
     pf = power_features
     maxf = 512
-    nblocks = 0
+    nblocks = 2
 
     features = input_
     for i in range(n_layers):
-        n_features = max(maxf, 2**(pf+i))
+        n_features = min(maxf, 2**(pf+i))
         features = conv_op(features, 5, n_features, stride = 2)
         features = norm_op(features)
         features = acti_op(features)
@@ -482,12 +482,12 @@ def make_det_dec(input_, power_features, n_layers, out_channels = 3):
 
     pf = power_features
     maxf = 512
-    nblocks = 0
+    nblocks = 2
 
     # build top down
     features = input_
     for l in reversed(range(n_layers)):
-        n_features = max(maxf, 2**(pf+l-1))
+        n_features = min(maxf, 2**(pf+l-1))
         for j in range(nblocks):
             features = residual_block(features)
         if l > 0:
@@ -536,12 +536,12 @@ class Model(object):
 
     def make_style_det_enc(self, name):
         return make_model(name, make_det_enc,
-                power_features = 5, n_layers = 3)
+                power_features = 5, n_layers = 6)
 
 
     def make_style_enc(self, name):
         return make_model(name, make_enc,
-                power_features = 8, n_layers = 1)
+                power_features = 11, n_layers = 1)
 
 
     def define_graph(self):
@@ -556,7 +556,12 @@ class Model(object):
         self.log_ops["global_step"] = global_step
 
         n_domains = 2
-        lat_weight = 0.0
+        kl_weight = make_linear_var(
+                step = global_step,
+                start = 100, end = 2500,
+                start_value = 0.0, end_value = 1.0,
+                clip_min = 0.0, clip_max = 1.0)
+        self.log_ops["kl_weight"] = kl_weight
 
         # adjacency matrix of active streams with (i,j) indicating stream
         # from domain i to domain j
@@ -596,7 +601,7 @@ class Model(object):
             assert(i == j)
             n = np.argwhere(g_auto_streams).shape[0]
 
-            z_style, kl_style = ae_infer_z(g_inputs[i], g_head_style_enc, g_style_enc, sample = True)
+            z_style, kl_style = ae_infer_z(g_inputs[j], g_head_style_enc, g_style_enc, sample = True)
             z_pose, kl_pose = ae_infer_z(g_inputs[i], g_head_encs[i], g_enc, sample = False)
             zs = z_style + z_pose
             rec = ae_infer_x(zs, g_dec, g_tail_decs[j])
@@ -604,7 +609,7 @@ class Model(object):
             lat_loss = kl_style + kl_pose
             rec_loss = ae_likelihood(g_inputs[j], rec)
 
-            g_ae_loss += (rec_loss + lat_loss) / n
+            g_ae_loss += (rec_loss + kl_weight*lat_loss) / n
 
             self.img_ops["g_{}_{}".format(i,j)] = rec
             self.log_ops["g_ae_loss_rec_{}_{}".format(i,j)] = rec_loss
@@ -616,7 +621,7 @@ class Model(object):
             assert(i != j)
             n = np.argwhere(g_cross_streams).shape[0]
 
-            z_style, kl_style = ae_infer_z(g_inputs[i], g_head_style_enc, g_style_enc, sample = True)
+            z_style, kl_style = ae_infer_z(g_inputs[j], g_head_style_enc, g_style_enc, sample = True)
             z_pose, kl_pose = ae_infer_z(g_inputs[i], g_head_encs[i], g_enc, sample = False)
             zs = z_style + z_pose
             rec = ae_infer_x(zs, g_dec, g_tail_decs[j])
@@ -624,7 +629,7 @@ class Model(object):
             lat_loss = kl_style + kl_pose
             rec_loss = ae_likelihood(g_inputs[j], rec)
 
-            g_su_loss += (rec_loss + lat_loss)/n
+            g_su_loss += (rec_loss + kl_weight*lat_loss)/n
             self.img_ops["g_su_{}_{}".format(i,j)] = rec
             self.log_ops["g_su_loss_rec_{}_{}".format(i,j)] = rec_loss
             self.log_ops["g_su_loss_lat_{}_{}".format(i,j)] = lat_loss
