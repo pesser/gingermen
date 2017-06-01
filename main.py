@@ -123,6 +123,46 @@ def get_batches(split, img_shape, batch_size, names):
     return BufferedWrapper(flow)
 
 
+class TestFileFlow(object):
+    """Same as FileFlow but without shuffling and just a single path."""
+    def __init__(self, path, batch_size, img_shape):
+        fnames = sorted(fname for fname in os.listdir(path) if fname.endswith(".jpg"))
+        self.batch_size = batch_size
+        self.img_shape = img_shape
+        self.path = path
+        self.fnames = fnames
+        self.n = len(fnames)
+        logging.info("Found {} images.".format(self.n))
+        self.batch_start = 0
+
+
+    def __next__(self):
+        batch_start, batch_end = self.batch_start, self.batch_start + self.batch_size
+        # do
+        batch_fnames = self.fnames[batch_start:batch_end]
+
+        current_batch_size = len(batch_fnames)
+        grayscale = self.img_shape[2] == 1
+
+        path = self.path
+        path_batch = np.zeros((current_batch_size,) + self.img_shape, dtype = "float32")
+        for i, fname in enumerate(batch_fnames):
+            x = load_img(os.path.join(path, fname), target_size = self.img_shape)
+            path_batch[i] = x
+
+        if batch_end > self.n:
+            self.batch_start = 0
+        else:
+            self.batch_start = batch_end
+
+        return path_batch
+
+
+def get_test_batches(path, img_shape, batch_size):
+    flow = TestFileFlow(path, batch_size, img_shape)
+    return BufferedWrapper(flow)
+
+
 def tile(X, rows, cols):
     """Tile images for display."""
     tiling = np.zeros((rows * X.shape[1], cols * X.shape[2], X.shape[3]), dtype = X.dtype)
@@ -136,6 +176,13 @@ def tile(X, rows, cols):
                         j*X.shape[2]:(j+1)*X.shape[2],
                         :] = img
     return tiling
+
+
+def save_image(X, name):
+    X = (X + 1.0) / 2.0
+    X = np.clip(X, 0.0, 1.0)
+    fname = os.path.join(out_dir, name + ".png")
+    PIL.Image.fromarray(np.uint8(255*X)).save(fname)
 
 
 def plot_images(X, name):
@@ -509,7 +556,7 @@ def make_dec(input_, n_layers, out_channels = 3):
 
     return output
 
-
+"""
 def make_style_enc(input_, power_features):
     # ops
     conv_op = tf_conv
@@ -548,6 +595,7 @@ def make_style_enc(input_, power_features):
     vars_.append(var_)
 
     return means + vars_
+"""
 
 
 class Model(object):
@@ -556,7 +604,7 @@ class Model(object):
         self.lr = 1e-4
         self.n_total_steps = n_total_steps
         self.log_frequency = 100
-        self.ckpt_frequency = 1500
+        self.ckpt_frequency = 500
         self.best_loss = float("inf")
         self.define_graph()
         self.restore_path = restore_path
@@ -584,9 +632,11 @@ class Model(object):
         return make_model(name, make_u_dec)
 
 
+    """
     def make_style_enc(self, name):
         return make_model(name, make_style_enc,
                 power_features = 7)
+    """
 
 
     def define_graph(self):
@@ -626,7 +676,7 @@ class Model(object):
         g_tail_decs = dict(
                 (i, self.make_dec("generator_tail_{}".format(i)))
                 for i in g_output_streams)
-        g_style_enc = self.make_style_enc("generator_style_enc")
+        #g_style_enc = self.make_style_enc("generator_style_enc")
 
         #g_head_style_enc = self.make_style_det_enc("generator_head_style_enc")
         #g_style_enc = self.make_style_enc("generator_style_enc")
@@ -646,21 +696,24 @@ class Model(object):
 
             input_ = g_inputs[i]
             target = g_inputs[j]
-
+            zs = g_enc(g_head_encs[i](input_))
+            """
             style_params = g_style_enc(target)
             style_zs, style_kl = ae_sampling(style_params, sample = True)
 
             pose_zs = g_enc(g_head_encs[i](input_))
 
             zs = pose_zs + style_zs
+            """
             dec = g_tail_decs[j](g_dec(zs))
             dec_loss = ae_likelihood(target, dec, loss = "h1")
 
-            lat_loss = kl_weight*style_kl
-            g_su_loss += (dec_loss + lat_loss)/n
+            g_su_loss += (dec_loss)/n
+            #lat_loss = kl_weight*style_kl
+            #g_su_loss += (dec_loss + lat_loss)/n
             self.img_ops["g_su_{}_{}".format(i,j)] = dec
             self.log_ops["g_su_loss_dec_{}_{}".format(i,j)] = dec_loss
-            self.log_ops["g_su_loss_lat_{}_{}".format(i,j)] = lat_loss
+            #self.log_ops["g_su_loss_lat_{}_{}".format(i,j)] = lat_loss
         self.log_ops["g_su_loss"] = g_su_loss
 
         # g total loss
@@ -674,7 +727,8 @@ class Model(object):
         # testing
         test_inputs = tf.placeholder(tf.float32, shape = (None,) + self.img_shape)
         self.test_inputs = test_inputs
-
+        zs = g_enc(g_head_encs[1](test_inputs))
+        """
         z_style_shape = style_zs[0].get_shape().as_list()[1:]
         batch_style_shape = [tf.shape(test_inputs)[0]] + z_style_shape
 
@@ -682,12 +736,13 @@ class Model(object):
         pose_zs = g_enc(g_head_encs[1](test_inputs))
 
         zs = pose_zs + style_zs
+        """
         dec = g_tail_decs[0](g_dec(zs))
         self.test_outputs = dec
 
         # generator training
         g_trainable_weights = g_enc.trainable_weights + g_dec.trainable_weights
-        g_trainable_weights += g_style_enc.trainable_weights
+        #g_trainable_weights += g_style_enc.trainable_weights
         for i in g_input_streams:
             g_trainable_weights += g_head_encs[i].trainable_weights
         for i in g_output_streams:
@@ -764,18 +819,18 @@ class Model(object):
                 if validation_loss < self.best_loss:
                     logging.info("step {}: Validation loss improved from {:.4e} to {:.4e}".format(global_step, self.best_loss, validation_loss))
                     self.best_loss = validation_loss
-                    self.make_checkpoint(global_step)
-                elif global_step % self.ckpt_frequency == 0:
-                    self.make_checkpoint(global_step)
+                    self.make_checkpoint(global_step, prefix = "best_")
             # testing
             X_batch, Y_batch = next(self.valid_batches)
             feed_dict = {self.test_inputs: Y_batch}
             test_outputs = session.run(self.test_outputs, feed_dict)
             plot_images(test_outputs, "testing_{:07}".format(global_step))
+        if global_step % self.ckpt_frequency == 0:
+            self.make_checkpoint(global_step)
 
 
-    def make_checkpoint(self, global_step):
-        fname = os.path.join(self.checkpoint_dir, "model.ckpt")
+    def make_checkpoint(self, global_step, prefix = ""):
+        fname = os.path.join(self.checkpoint_dir, prefix + "model.ckpt")
         self.saver.save(
                 session,
                 fname,
@@ -783,10 +838,19 @@ class Model(object):
         logging.info("Saved model to {}".format(fname))
 
 
+    def test(self, test_batch):
+            feed_dict = {self.test_inputs: test_batch}
+            test_outputs = session.run(self.test_outputs, feed_dict)
+            return test_outputs
+
+
 if __name__ == "__main__":
     restore_path = None
-    if len(sys.argv) == 2:
+    test_path = None
+    if len(sys.argv) > 1:
         restore_path = sys.argv[1]
+    if len(sys.argv) > 2:
+        test_path = sys.argv[2]
 
     img_shape = (64, 64, 3)
     batch_size = 32
@@ -800,4 +864,15 @@ if __name__ == "__main__":
     n_epochs = 100
     n_total_steps = int(n_epochs * batches.n / batch_size)
     model = Model(img_shape, n_total_steps, restore_path)
-    model.fit(batches, valid_batches)
+    if not test_path:
+        model.fit(batches, valid_batches)
+    else:
+        test_batches = get_test_batches(test_path, img_shape, batch_size)
+        n_batches = int(math.ceil(test_batches.n / batch_size))
+        idx = 0
+        for i in trange(n_batches):
+            test_batch = next(test_batches)
+            test_results = model.test(test_batch)
+            for j in range(test_results.shape[0]):
+                save_image(test_results[j,...], "results_{:07}".format(idx))
+                idx = idx + 1
