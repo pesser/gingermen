@@ -556,47 +556,6 @@ def make_dec(input_, n_layers, out_channels = 3):
 
     return output
 
-"""
-def make_style_enc(input_, power_features):
-    # ops
-    conv_op = tf_conv
-    norm_op = tf_normalize
-    acti_op = lambda x: tf_activate(x, "leakyrelu")
-
-    # outputs
-    means = []
-    vars_ = []
-
-    maxf = 512
-    nblocks = 2
-    n_layers = 3
-    latent_dim = 128
-
-    n_features = min(maxf, 2**power_features)
-    features = input_
-    features = conv_op(features, 3, n_features, stride = 1)
-    for i in range(n_layers):
-        n_features = min(maxf, 2*n_features)
-        features = conv_op(features, 5, n_features, stride = 2)
-        features = norm_op(features)
-        features = acti_op(features)
-        for j in range(nblocks):
-            features = residual_block(features)
-    features = tf.contrib.layers.flatten(features)
-    # reintroduce spatial shape
-    features = tf.expand_dims(features, axis = 1)
-    features = tf.expand_dims(features, axis = 1)
-    print("lat shape: {}".format(features.get_shape().as_list()))
-
-    mean = conv_op(features, 1, latent_dim, stride = 1)
-    var_ = conv_op(features, 1, latent_dim, stride = 1)
-    var_ = tf_activate(var_, "softplus")
-    means.append(mean)
-    vars_.append(var_)
-
-    return means + vars_
-"""
-
 
 class Model(object):
     def __init__(self, img_shape, n_total_steps, restore_path = None):
@@ -615,7 +574,7 @@ class Model(object):
 
     def make_enc(self, name):
         return make_model(name, make_enc,
-                power_features = 7, n_layers = 0)
+                power_features = 6, n_layers = 0)
 
 
     def make_dec(self, name):
@@ -625,18 +584,11 @@ class Model(object):
 
     def make_u_enc(self, name):
         return make_model(name, make_u_enc,
-                n_layers = 2)
+                n_layers = 3)
 
 
     def make_u_dec(self, name):
         return make_model(name, make_u_dec)
-
-
-    """
-    def make_style_enc(self, name):
-        return make_model(name, make_style_enc,
-                power_features = 7)
-    """
 
 
     def define_graph(self):
@@ -676,10 +628,6 @@ class Model(object):
         g_tail_decs = dict(
                 (i, self.make_dec("generator_tail_{}".format(i)))
                 for i in g_output_streams)
-        #g_style_enc = self.make_style_enc("generator_style_enc")
-
-        #g_head_style_enc = self.make_style_det_enc("generator_head_style_enc")
-        #g_style_enc = self.make_style_enc("generator_style_enc")
 
         ## g training
         g_inputs = [tf.placeholder(tf.float32, shape = (None,) + self.img_shape) for i in range(n_domains)]
@@ -697,23 +645,12 @@ class Model(object):
             input_ = g_inputs[i]
             target = g_inputs[j]
             zs = g_enc(g_head_encs[i](input_))
-            """
-            style_params = g_style_enc(target)
-            style_zs, style_kl = ae_sampling(style_params, sample = True)
-
-            pose_zs = g_enc(g_head_encs[i](input_))
-
-            zs = pose_zs + style_zs
-            """
             dec = g_tail_decs[j](g_dec(zs))
             dec_loss = ae_likelihood(target, dec, loss = "h1")
 
             g_su_loss += (dec_loss)/n
-            #lat_loss = kl_weight*style_kl
-            #g_su_loss += (dec_loss + lat_loss)/n
             self.img_ops["g_su_{}_{}".format(i,j)] = dec
             self.log_ops["g_su_loss_dec_{}_{}".format(i,j)] = dec_loss
-            #self.log_ops["g_su_loss_lat_{}_{}".format(i,j)] = lat_loss
         self.log_ops["g_su_loss"] = g_su_loss
 
         # g total loss
@@ -728,15 +665,6 @@ class Model(object):
         test_inputs = tf.placeholder(tf.float32, shape = (None,) + self.img_shape)
         self.test_inputs = test_inputs
         zs = g_enc(g_head_encs[1](test_inputs))
-        """
-        z_style_shape = style_zs[0].get_shape().as_list()[1:]
-        batch_style_shape = [tf.shape(test_inputs)[0]] + z_style_shape
-
-        style_zs = [tf.random_normal(batch_style_shape, mean = 0.0, stddev = 1.0)]
-        pose_zs = g_enc(g_head_encs[1](test_inputs))
-
-        zs = pose_zs + style_zs
-        """
         dec = g_tail_decs[0](g_dec(zs))
         self.test_outputs = dec
 
@@ -852,7 +780,7 @@ if __name__ == "__main__":
     if len(sys.argv) > 2:
         test_path = sys.argv[2]
 
-    img_shape = (64, 64, 3)
+    img_shape = (128, 128, 3)
     batch_size = 32
 
     init_logging()
