@@ -4,14 +4,12 @@ config.gpu_options.allow_growth = False
 session = tf.Session(config = config)
 
 import os, sys, logging, shutil, datetime, socket, time, math, functools, itertools
+import argparse
 import numpy as np
 from multiprocessing.pool import ThreadPool
 import PIL.Image
 from tqdm import tqdm, trange
 
-
-data_dir = os.path.join(os.getcwd(), "data")
-assert(os.path.isdir(data_dir))
 
 out_base_dir = os.path.join(os.getcwd(), "log")
 os.makedirs(out_base_dir, exist_ok = True)
@@ -67,7 +65,6 @@ def load_img(path, target_size):
         img = img.resize(wh_tuple, resample = PIL.Image.BILINEAR)
 
     x = np.asarray(img, dtype = "uint8")
-    x = x / 127.5 - 1.0
     if len(x.shape) == 2:
         x = np.expand_dims(x, -1)
 
@@ -94,10 +91,9 @@ class FileFlow(object):
         batch_fnames = [self.fnames[i] for i in batch_indices]
 
         current_batch_size = len(batch_fnames)
-        grayscale = self.img_shape[2] == 1
         batches = []
         for path in self.paths:
-            path_batch = np.zeros((current_batch_size,) + self.img_shape, dtype = "float32")
+            path_batch = np.zeros((current_batch_size,) + self.img_shape, dtype = "uint8")
             for i, fname in enumerate(batch_fnames):
                 x = load_img(os.path.join(path, fname), target_size = self.img_shape)
                 path_batch[i] = x
@@ -116,50 +112,8 @@ class FileFlow(object):
         self.indices = np.random.permutation(self.n)
 
 
-def get_batches(split, img_shape, batch_size, names):
-    hostname = socket.gethostname()
-    domain_dirs = [os.path.join(data_dir, hostname, split, name) for name in names]
+def get_batches(img_shape, batch_size, domain_dirs):
     flow = FileFlow(batch_size, img_shape, domain_dirs)
-    return BufferedWrapper(flow)
-
-
-class TestFileFlow(object):
-    """Same as FileFlow but without shuffling and just a single path."""
-    def __init__(self, path, batch_size, img_shape):
-        fnames = sorted(fname for fname in os.listdir(path) if fname.endswith(".jpg"))
-        self.batch_size = batch_size
-        self.img_shape = img_shape
-        self.path = path
-        self.fnames = fnames
-        self.n = len(fnames)
-        logging.info("Found {} images.".format(self.n))
-        self.batch_start = 0
-
-
-    def __next__(self):
-        batch_start, batch_end = self.batch_start, self.batch_start + self.batch_size
-        # do
-        batch_fnames = self.fnames[batch_start:batch_end]
-
-        current_batch_size = len(batch_fnames)
-        grayscale = self.img_shape[2] == 1
-
-        path = self.path
-        path_batch = np.zeros((current_batch_size,) + self.img_shape, dtype = "float32")
-        for i, fname in enumerate(batch_fnames):
-            x = load_img(os.path.join(path, fname), target_size = self.img_shape)
-            path_batch[i] = x
-
-        if batch_end > self.n:
-            self.batch_start = 0
-        else:
-            self.batch_start = batch_end
-
-        return path_batch
-
-
-def get_test_batches(path, img_shape, batch_size):
-    flow = TestFileFlow(path, batch_size, img_shape)
     return BufferedWrapper(flow)
 
 
@@ -179,21 +133,19 @@ def tile(X, rows, cols):
 
 
 def save_image(X, name):
-    X = (X + 1.0) / 2.0
-    X = np.clip(X, 0.0, 1.0)
     fname = os.path.join(out_dir, name + ".png")
-    PIL.Image.fromarray(np.uint8(255*X)).save(fname)
+    PIL.Image.fromarray(X).save(fname)
 
 
 def plot_images(X, name):
-    X = (X + 1.0) / 2.0
-    X = np.clip(X, 0.0, 1.0)
+    #X = (X + 1.0) / 2.0
+    #X = np.clip(X, 0.0, 1.0)
     rc = math.sqrt(X.shape[0])
     rows = cols = math.ceil(rc)
     canvas = tile(X, rows, cols)
     fname = os.path.join(out_dir, name + ".png")
     canvas = np.squeeze(canvas)
-    PIL.Image.fromarray(np.uint8(255*canvas)).save(fname)
+    PIL.Image.fromarray(canvas).save(fname)
 
 
 def make_linear_var(
@@ -229,6 +181,17 @@ def split_batch(batch):
         batch_a.append(d_a)
         batch_b.append(d_b)
     return batch_a, batch_b
+
+
+def tf_preprocess(x):
+    return tf.cast(x, tf.float32) / 127.5 - 1.0
+
+
+def tf_postprocess(x):
+    x = (x + 1.0) / 2.0
+    x = tf.clip_by_value(255 * x, 0, 255)
+    x = tf.cast(x, tf.uint8)
+    return x
 
 
 def tf_corrupt(x, eps):
@@ -562,7 +525,7 @@ class Model(object):
         self.img_shape = img_shape
         self.lr = 1e-4
         self.n_total_steps = n_total_steps
-        self.log_frequency = 100
+        self.log_frequency = 50
         self.ckpt_frequency = 500
         self.best_loss = float("inf")
         self.define_graph()
@@ -630,11 +593,12 @@ class Model(object):
                 for i in g_output_streams)
 
         ## g training
-        g_inputs = [tf.placeholder(tf.float32, shape = (None,) + self.img_shape) for i in range(n_domains)]
-        self.inputs["g_inputs"] = g_inputs
+        g_raw_inputs = [tf.placeholder(tf.uint8, shape = (None,) + self.img_shape) for i in range(n_domains)]
+        g_inputs = [tf_preprocess(x) for x in g_raw_inputs]
+        self.inputs["g_inputs"] = g_raw_inputs
         for i in range(len(g_inputs)):
-            self.img_ops["g_inputs_{}".format(i)] = g_inputs[i]
-            self.img_ops["g_inputs_{}_edges".format(i)] = tf_grad_mag(g_inputs[i])
+            self.img_ops["g_inputs_{}".format(i)] = tf_postprocess(g_inputs[i])
+            self.img_ops["g_inputs_{}_edges".format(i)] = tf_postprocess(tf_grad_mag(g_inputs[i]))
 
         # supervised translation
         g_su_loss = tf.to_float(0.0)
@@ -649,7 +613,7 @@ class Model(object):
             dec_loss = ae_likelihood(target, dec, loss = "h1")
 
             g_su_loss += (dec_loss)/n
-            self.img_ops["g_su_{}_{}".format(i,j)] = dec
+            self.img_ops["g_su_{}_{}".format(i,j)] = tf_postprocess(dec)
             self.log_ops["g_su_loss_dec_{}_{}".format(i,j)] = dec_loss
         self.log_ops["g_su_loss"] = g_su_loss
 
@@ -662,11 +626,12 @@ class Model(object):
         self.log_ops["loss"] = loss
 
         # testing
-        test_inputs = tf.placeholder(tf.float32, shape = (None,) + self.img_shape)
-        self.test_inputs = test_inputs
+        test_raw_inputs = tf.placeholder(tf.float32, shape = (None,) + self.img_shape)
+        test_inputs = tf_preprocess(test_raw_inputs)
+        self.test_inputs = test_raw_inputs
         zs = g_enc(g_head_encs[1](test_inputs))
         dec = g_tail_decs[0](g_dec(zs))
-        self.test_outputs = dec
+        self.test_outputs = tf_postprocess(dec)
 
         # generator training
         g_trainable_weights = g_enc.trainable_weights + g_dec.trainable_weights
@@ -749,10 +714,11 @@ class Model(object):
                     self.best_loss = validation_loss
                     self.make_checkpoint(global_step, prefix = "best_")
             # testing
-            X_batch, Y_batch = next(self.valid_batches)
-            feed_dict = {self.test_inputs: Y_batch}
-            test_outputs = session.run(self.test_outputs, feed_dict)
-            plot_images(test_outputs, "testing_{:07}".format(global_step))
+            if self.valid_batches is not None:
+                X_batch, Y_batch = next(self.valid_batches)
+                feed_dict = {self.test_inputs: Y_batch}
+                test_outputs = session.run(self.test_outputs, feed_dict)
+                plot_images(test_outputs, "testing_{:07}".format(global_step))
         if global_step % self.ckpt_frequency == 0:
             self.make_checkpoint(global_step)
 
@@ -773,34 +739,55 @@ class Model(object):
 
 
 if __name__ == "__main__":
-    restore_path = None
-    test_path = None
-    if len(sys.argv) > 1:
-        restore_path = sys.argv[1]
-    if len(sys.argv) > 2:
-        test_path = sys.argv[2]
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--mode", default = "train", choices=["train", "test"])
+    parser.add_argument("--data_dir", required = True, help = "path to training or testing data")
+    parser.add_argument("--valid_dir", help = "path to validation data")
+    parser.add_argument("--batch_size", default = 32)
+    parser.add_argument("--n_epochs", default = 100)
+    parser.add_argument("--checkpoint", help = "path to checkpoint to restore")
+    opt = parser.parse_args()
+
+    if not os.path.isdir(opt.data_dir):
+        raise Exception("Invalid data dir: {}".format(opt.data_dir))
+
+    batch_size = opt.batch_size
+    restore_path = opt.checkpoint
+    n_epochs = opt.n_epochs
+    mode = opt.mode
 
     img_shape = (128, 128, 3)
-    batch_size = 32
 
     init_logging()
-    batches = get_batches("train", img_shape, batch_size, ["x", "y"])
-    logging.info("Number of training samples: {}".format(batches.n))
-    valid_batches = get_batches("valid", img_shape, batch_size, ["x", "y"])
-    logging.info("Number of validation samples: {}".format(valid_batches.n))
 
-    n_epochs = 100
-    n_total_steps = int(n_epochs * batches.n / batch_size)
-    model = Model(img_shape, n_total_steps, restore_path)
-    if not test_path:
+    if mode == "train":
+        batches = get_batches(img_shape, batch_size, [
+            os.path.join(opt.data_dir, "domain2"),
+            os.path.join(opt.data_dir, "domain1")])
+        logging.info("Number of training samples: {}".format(batches.n))
+
+        if opt.valid_dir is not None:
+            valid_batches = get_batches(img_shape, batch_size, [
+                os.path.join(opt.valid_dir, "domain2"),
+                os.path.join(opt.valid_dir, "domain1")])
+            logging.info("Number of validation samples: {}".format(valid_batches.n))
+        else:
+            valid_batches = None
+
+        n_total_steps = int(n_epochs * batches.n / batch_size)
+        model = Model(img_shape, n_total_steps, restore_path)
         model.fit(batches, valid_batches)
     else:
-        test_batches = get_test_batches(test_path, img_shape, batch_size)
+        model = Model(img_shape, 0, restore_path)
+        if not restore_path:
+            raise Exception("Testing requires --checkpoint")
+        test_batches = get_batches(img_shape, batch_size, [opt.data_dir])
         n_batches = int(math.ceil(test_batches.n / batch_size))
         idx = 0
         for i in trange(n_batches):
-            test_batch = next(test_batches)
+            test_batch, = next(test_batches)
             test_results = model.test(test_batch)
             for j in range(test_results.shape[0]):
-                save_image(test_results[j,...], "results_{:07}".format(idx))
+                save_image(test_batch[j,...], "{:07}_input".format(idx))
+                save_image(test_results[j,...], "{:07}_output".format(idx))
                 idx = idx + 1
