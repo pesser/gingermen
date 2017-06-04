@@ -9,6 +9,8 @@ import numpy as np
 from multiprocessing.pool import ThreadPool
 import PIL.Image
 from tqdm import tqdm, trange
+import pickle
+import cv2
 
 
 out_base_dir = os.path.join(os.getcwd(), "log")
@@ -71,6 +73,107 @@ def load_img(path, target_size):
     return x
 
 
+class IndexFlow(object):
+    def __init__(self, batch_size, img_shape, index_path, train):
+        self.batch_size = batch_size
+        self.img_shape = img_shape
+        with open(index_path, "rb") as f:
+            self.index = pickle.load(f)
+        self.train = train
+        self.basepath = os.path.dirname(index_path)
+
+        for k in ["imgs", "masks", "joints"]:
+            self.index[k] = [v for i, v in enumerate(self.index[k]) if self.index["train"][i] == self.train]
+        self.index["joints"] = [v * self.img_shape[0] / 256 for v in self.index["joints"]]
+
+        self.n = len(self.index["imgs"])
+        logging.info("Found {} images.".format(self.n))
+        self.shuffle()
+
+
+    def __next__(self):
+        batch_start, batch_end = self.batch_start, self.batch_start + self.batch_size
+        batch_indices = self.indices[batch_start:batch_end]
+
+        batch = dict()
+        for k in ["imgs", "masks", "joints"]:
+            batch[k] = [self.index[k][i] for i in batch_indices]
+
+        # load image and mask
+        for k in ["imgs", "masks"]:
+            batch_data = list()
+            for fname in batch[k]:
+                path = os.path.join(self.basepath, fname)
+                batch_data.append(load_img(path, target_size = self.img_shape))
+            batch_data = np.stack(batch_data)
+            batch[k] = batch_data
+
+        # generate joint image
+        jo = self.index["joint_order"]
+        batch_data = list()
+        for joints in batch["joints"]:
+            # three channels: left, right, center
+            imgs = list()
+            for i in range(3):
+                imgs.append(np.zeros(self.img_shape[:2], dtype = "uint8"))
+
+            body = ["lhip", "lshoulder", "rshoulder", "rhip"]
+            body_pts = np.array([[joints[jo.index(part),:] for part in body]])
+            if np.min(body_pts) >= 0:
+                body_pts = np.int_(body_pts)
+                cv2.fillPoly(imgs[2], body_pts, 255)
+            head = ["lshoulder", "chead", "rshoulder"]
+            head_pts = np.array([[joints[jo.index(part),:] for part in head]])
+            if np.min(head_pts) >= 0:
+                head_pts = np.int_(head_pts)
+                cv2.fillPoly(imgs[0], head_pts, 127)
+                cv2.fillPoly(imgs[1], head_pts, 127)
+
+            right_lines = [
+                    ("rankle", "rknee"),
+                    ("rknee", "rhip"),
+                    ("rhip", "rshoulder"),
+                    ("rshoulder", "relbow"),
+                    ("relbow", "rwrist"),
+                    ("rshoulder", "chead")]
+            for line in right_lines:
+                l = [jo.index(line[0]), jo.index(line[1])]
+                if np.min(joints[l]) >= 0:
+                    a = tuple(np.int_(joints[l[0]]))
+                    b = tuple(np.int_(joints[l[1]]))
+                    cv2.line(imgs[0], a, b, color = 255, thickness = 1)
+
+            left_lines = [
+                    ("lankle", "lknee"),
+                    ("lknee", "lhip"),
+                    ("lhip", "lshoulder"),
+                    ("lshoulder", "lelbow"),
+                    ("lelbow", "lwrist"),
+                    ("lshoulder", "chead")]
+            for line in left_lines:
+                l = [jo.index(line[0]), jo.index(line[1])]
+                if np.min(joints[l]) >= 0:
+                    a = tuple(np.int_(joints[l[0]]))
+                    b = tuple(np.int_(joints[l[1]]))
+                    cv2.line(imgs[1], a, b, color = 255, thickness = 1)
+
+            img = np.stack(imgs, axis = -1)
+            batch_data.append(img)
+        batch["joints"] = np.stack(batch_data)
+
+        if batch_end > self.n:
+            self.shuffle()
+        else:
+            self.batch_start = batch_end
+
+        return batch["imgs"], batch["masks"], batch["joints"]
+
+
+    def shuffle(self):
+        self.batch_start = 0
+        self.indices = np.random.permutation(self.n)
+
+
 class FileFlow(object):
     def __init__(self, batch_size, img_shape, paths):
         fnames = list(set(fname for fname in os.listdir(path) if fname.endswith(".jpg")) for path in paths)
@@ -112,8 +215,8 @@ class FileFlow(object):
         self.indices = np.random.permutation(self.n)
 
 
-def get_batches(img_shape, batch_size, domain_dirs):
-    flow = FileFlow(batch_size, img_shape, domain_dirs)
+def get_batches(img_shape, batch_size, path, train):
+    flow = IndexFlow(batch_size, img_shape, path, train)
     return BufferedWrapper(flow)
 
 
@@ -187,8 +290,20 @@ def tf_preprocess(x):
     return tf.cast(x, tf.float32) / 127.5 - 1.0
 
 
+def tf_preprocess_mask(x):
+    mask = tf.cast(x, tf.float32) / 255.0
+    mask = tf.reduce_max(mask, axis = -1, keep_dims = True)
+    return mask
+
+
 def tf_postprocess(x):
     x = (x + 1.0) / 2.0
+    x = tf.clip_by_value(255 * x, 0, 255)
+    x = tf.cast(x, tf.uint8)
+    return x
+
+
+def tf_postprocess_mask(x):
     x = tf.clip_by_value(255 * x, 0, 255)
     x = tf.cast(x, tf.uint8)
     return x
@@ -596,9 +711,13 @@ class Model(object):
         g_raw_inputs = [tf.placeholder(tf.uint8, shape = (None,) + self.img_shape) for i in range(n_domains)]
         g_inputs = [tf_preprocess(x) for x in g_raw_inputs]
         self.inputs["g_inputs"] = g_raw_inputs
+        self.inputs["mask"] = tf.placeholder(tf.uint8, shape = (None,) + self.img_shape)
+        mask = tf_preprocess_mask(self.inputs["mask"])
         for i in range(len(g_inputs)):
             self.img_ops["g_inputs_{}".format(i)] = tf_postprocess(g_inputs[i])
-            self.img_ops["g_inputs_{}_edges".format(i)] = tf_postprocess(tf_grad_mag(g_inputs[i]))
+            self.img_ops["g_inputs_{}_masked".format(i)] = tf_postprocess(mask * g_inputs[i])
+            #self.img_ops["g_inputs_{}_edges".format(i)] = tf_postprocess(tf_grad_mag(g_inputs[i]))
+        self.img_ops["mask"] = tf_postprocess_mask(mask)
 
         # supervised translation
         g_su_loss = tf.to_float(0.0)
@@ -610,10 +729,13 @@ class Model(object):
             target = g_inputs[j]
             zs = g_enc(g_head_encs[i](input_))
             dec = g_tail_decs[j](g_dec(zs))
-            dec_loss = ae_likelihood(target, dec, loss = "h1")
+            dec_masked = mask * dec
+            target_masked = mask * target
+            dec_loss = ae_likelihood(target_masked, dec_masked, loss = "h1")
 
             g_su_loss += (dec_loss)/n
             self.img_ops["g_su_{}_{}".format(i,j)] = tf_postprocess(dec)
+            self.img_ops["g_su_{}_{}_masked".format(i,j)] = tf_postprocess(dec_masked)
             self.log_ops["g_su_loss_dec_{}_{}".format(i,j)] = dec_loss
         self.log_ops["g_su_loss"] = g_su_loss
 
@@ -666,10 +788,12 @@ class Model(object):
     def fit(self, batches, valid_batches = None):
         self.valid_batches = valid_batches
         for batch in trange(self.n_total_steps):
-            X1_batch, Y1_batch = next(batches)
+            #X1_batch, Y1_batch = next(batches)
+            X_batch, Y_batch, Z_batch = next(batches)
             feed_dict = {
-                    self.inputs["g_inputs"][0]: X1_batch,
-                    self.inputs["g_inputs"][1]: Y1_batch}
+                    self.inputs["mask"]: Y_batch,
+                    self.inputs["g_inputs"][0]: X_batch,
+                    self.inputs["g_inputs"][1]: Z_batch}
             fetch_dict = {"train": self.train_ops}
             if self.log_ops["global_step"].eval(session) % self.log_frequency == 0:
                 fetch_dict["log"] = self.log_ops
@@ -693,10 +817,11 @@ class Model(object):
 
             if self.valid_batches is not None:
                 # validation samples
-                X1_batch, Y1_batch = next(self.valid_batches)
+                X_batch, Y_batch, Z_batch = next(self.valid_batches)
                 feed_dict = {
-                        self.inputs["g_inputs"][0]: X1_batch,
-                        self.inputs["g_inputs"][1]: Y1_batch}
+                        self.inputs["mask"]: Y_batch,
+                        self.inputs["g_inputs"][0]: X_batch,
+                        self.inputs["g_inputs"][1]: Z_batch}
                 fetch_dict = dict()
                 fetch_dict["imgs"] = self.img_ops
                 # validation loss
@@ -715,8 +840,8 @@ class Model(object):
                     self.make_checkpoint(global_step, prefix = "best_")
             # testing
             if self.valid_batches is not None:
-                X_batch, Y_batch = next(self.valid_batches)
-                feed_dict = {self.test_inputs: Y_batch}
+                X_batch, Y_batch, Z_batch = next(self.valid_batches)
+                feed_dict = {self.test_inputs: Z_batch}
                 test_outputs = session.run(self.test_outputs, feed_dict)
                 plot_images(test_outputs, "testing_{:07}".format(global_step))
         if global_step % self.ckpt_frequency == 0:
@@ -742,7 +867,6 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--mode", default = "train", choices=["train", "test"])
     parser.add_argument("--data_dir", required = True, help = "path to training or testing data")
-    parser.add_argument("--valid_dir", help = "path to validation data")
     parser.add_argument("--batch_size", default = 32)
     parser.add_argument("--n_epochs", default = 100)
     parser.add_argument("--checkpoint", help = "path to checkpoint to restore")
@@ -761,23 +885,18 @@ if __name__ == "__main__":
     init_logging()
 
     if mode == "train":
-        batches = get_batches(img_shape, batch_size, [
-            os.path.join(opt.data_dir, "domain2"),
-            os.path.join(opt.data_dir, "domain1")])
+        batches = get_batches(img_shape, batch_size, os.path.join(opt.data_dir, "index.p"), train = True)
         logging.info("Number of training samples: {}".format(batches.n))
-
-        if opt.valid_dir is not None:
-            valid_batches = get_batches(img_shape, batch_size, [
-                os.path.join(opt.valid_dir, "domain2"),
-                os.path.join(opt.valid_dir, "domain1")])
-            logging.info("Number of validation samples: {}".format(valid_batches.n))
-        else:
+        valid_batches = get_batches(img_shape, batch_size, os.path.join(opt.data_dir, "index.p"), train = False)
+        logging.info("Number of validation samples: {}".format(valid_batches.n))
+        if valid_batches.n == 0:
             valid_batches = None
 
         n_total_steps = int(n_epochs * batches.n / batch_size)
         model = Model(img_shape, n_total_steps, restore_path)
         model.fit(batches, valid_batches)
     else:
+        # TODO
         model = Model(img_shape, 0, restore_path)
         if not restore_path:
             raise Exception("Testing requires --checkpoint")
