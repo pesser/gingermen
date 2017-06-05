@@ -117,45 +117,99 @@ class IndexFlow(object):
             for i in range(3):
                 imgs.append(np.zeros(self.img_shape[:2], dtype = "uint8"))
 
-            body = ["lhip", "lshoulder", "rshoulder", "rhip"]
-            body_pts = np.array([[joints[jo.index(part),:] for part in body]])
-            if np.min(body_pts) >= 0:
-                body_pts = np.int_(body_pts)
-                cv2.fillPoly(imgs[2], body_pts, 255)
-            head = ["lshoulder", "chead", "rshoulder"]
-            head_pts = np.array([[joints[jo.index(part),:] for part in head]])
-            if np.min(head_pts) >= 0:
-                head_pts = np.int_(head_pts)
-                cv2.fillPoly(imgs[0], head_pts, 127)
-                cv2.fillPoly(imgs[1], head_pts, 127)
+            if "chead" in jo:
+                thickness = 3
 
-            right_lines = [
-                    ("rankle", "rknee"),
-                    ("rknee", "rhip"),
-                    ("rhip", "rshoulder"),
-                    ("rshoulder", "relbow"),
-                    ("relbow", "rwrist"),
-                    ("rshoulder", "chead")]
-            for line in right_lines:
-                l = [jo.index(line[0]), jo.index(line[1])]
-                if np.min(joints[l]) >= 0:
-                    a = tuple(np.int_(joints[l[0]]))
-                    b = tuple(np.int_(joints[l[1]]))
-                    cv2.line(imgs[0], a, b, color = 255, thickness = 1)
+                body = ["lhip", "lshoulder", "rshoulder", "rhip"]
+                body_pts = np.array([[joints[jo.index(part),:] for part in body]])
+                if np.min(body_pts) >= 0:
+                    body_pts = np.int_(body_pts)
+                    cv2.fillPoly(imgs[2], body_pts, 255)
+                """
+                head = ["lshoulder", "chead", "rshoulder"]
+                head_pts = np.array([[joints[jo.index(part),:] for part in head]])
+                if np.min(head_pts) >= 0:
+                    head_pts = np.int_(head_pts)
+                    cv2.fillPoly(imgs[0], head_pts, 127)
+                    cv2.fillPoly(imgs[1], head_pts, 127)
+                """
 
-            left_lines = [
-                    ("lankle", "lknee"),
-                    ("lknee", "lhip"),
-                    ("lhip", "lshoulder"),
-                    ("lshoulder", "lelbow"),
-                    ("lelbow", "lwrist"),
-                    ("lshoulder", "chead")]
-            for line in left_lines:
-                l = [jo.index(line[0]), jo.index(line[1])]
-                if np.min(joints[l]) >= 0:
-                    a = tuple(np.int_(joints[l[0]]))
-                    b = tuple(np.int_(joints[l[1]]))
-                    cv2.line(imgs[1], a, b, color = 255, thickness = 1)
+                right_lines = [
+                        ("rankle", "rknee"),
+                        ("rknee", "rhip"),
+                        ("rhip", "rshoulder"),
+                        ("rshoulder", "relbow"),
+                        ("relbow", "rwrist")]
+                for line in right_lines:
+                    l = [jo.index(line[0]), jo.index(line[1])]
+                    if np.min(joints[l]) >= 0:
+                        a = tuple(np.int_(joints[l[0]]))
+                        b = tuple(np.int_(joints[l[1]]))
+                        cv2.line(imgs[0], a, b, color = 255, thickness = thickness)
+
+                left_lines = [
+                        ("lankle", "lknee"),
+                        ("lknee", "lhip"),
+                        ("lhip", "lshoulder"),
+                        ("lshoulder", "lelbow"),
+                        ("lelbow", "lwrist")]
+                for line in left_lines:
+                    l = [jo.index(line[0]), jo.index(line[1])]
+                    if np.min(joints[l]) >= 0:
+                        a = tuple(np.int_(joints[l[0]]))
+                        b = tuple(np.int_(joints[l[1]]))
+                        cv2.line(imgs[1], a, b, color = 255, thickness = thickness)
+
+                rs = joints[jo.index("rshoulder")]
+                ls = joints[jo.index("lshoulder")]
+                cn = joints[jo.index("chead")]
+                neck = 0.5*(rs+ls)
+                a = tuple(np.int_(neck))
+                b = tuple(np.int_(cn))
+                cv2.line(imgs[0], a, b, color = 127, thickness = thickness)
+                cv2.line(imgs[1], a, b, color = 127, thickness = thickness)
+            else:
+                body = ["lhip", "lshoulder", "rshoulder", "rhip"]
+                body_pts = np.array([[joints[jo.index(part),:] for part in body]])
+                if np.min(body_pts) >= 0:
+                    body_pts = np.int_(body_pts)
+                    cv2.fillPoly(imgs[2], body_pts, 255)
+
+                thickness = 3
+                right_lines = [
+                        ("rankle", "rknee"),
+                        ("rknee", "rhip"),
+                        ("rhip", "rshoulder"),
+                        ("rshoulder", "relbow"),
+                        ("relbow", "rwrist")]
+                for line in right_lines:
+                    l = [jo.index(line[0]), jo.index(line[1])]
+                    if np.min(joints[l]) >= 0:
+                        a = tuple(np.int_(joints[l[0]]))
+                        b = tuple(np.int_(joints[l[1]]))
+                        cv2.line(imgs[0], a, b, color = 255, thickness = thickness)
+
+                left_lines = [
+                        ("lankle", "lknee"),
+                        ("lknee", "lhip"),
+                        ("lhip", "lshoulder"),
+                        ("lshoulder", "lelbow"),
+                        ("lelbow", "lwrist")]
+                for line in left_lines:
+                    l = [jo.index(line[0]), jo.index(line[1])]
+                    if np.min(joints[l]) >= 0:
+                        a = tuple(np.int_(joints[l[0]]))
+                        b = tuple(np.int_(joints[l[1]]))
+                        cv2.line(imgs[1], a, b, color = 255, thickness = thickness)
+
+                rs = joints[jo.index("rshoulder")]
+                ls = joints[jo.index("lshoulder")]
+                cn = joints[jo.index("cnose")]
+                neck = 0.5*(rs+ls)
+                a = tuple(np.int_(neck))
+                b = tuple(np.int_(cn))
+                cv2.line(imgs[0], a, b, color = 127, thickness = thickness)
+                cv2.line(imgs[1], a, b, color = 127, thickness = thickness)
 
             img = np.stack(imgs, axis = -1)
             batch_data.append(img)
@@ -292,7 +346,8 @@ def tf_preprocess(x):
 
 def tf_preprocess_mask(x):
     mask = tf.cast(x, tf.float32) / 255.0
-    mask = tf.reduce_max(mask, axis = -1, keep_dims = True)
+    if mask.get_shape().as_list()[-1] == 3:
+        mask = tf.reduce_max(mask, axis = -1, keep_dims = True)
     return mask
 
 
@@ -662,7 +717,7 @@ class Model(object):
 
     def make_u_enc(self, name):
         return make_model(name, make_u_enc,
-                n_layers = 3)
+                n_layers = 5)
 
 
     def make_u_dec(self, name):
@@ -729,13 +784,13 @@ class Model(object):
             target = g_inputs[j]
             zs = g_enc(g_head_encs[i](input_))
             dec = g_tail_decs[j](g_dec(zs))
-            dec_masked = mask * dec
+            #dec_masked = mask * dec
             target_masked = mask * target
-            dec_loss = ae_likelihood(target_masked, dec_masked, loss = "h1")
+            dec_loss = ae_likelihood(target_masked, dec, loss = "h1")
 
             g_su_loss += (dec_loss)/n
             self.img_ops["g_su_{}_{}".format(i,j)] = tf_postprocess(dec)
-            self.img_ops["g_su_{}_{}_masked".format(i,j)] = tf_postprocess(dec_masked)
+            #self.img_ops["g_su_{}_{}_masked".format(i,j)] = tf_postprocess(dec_masked)
             self.log_ops["g_su_loss_dec_{}_{}".format(i,j)] = dec_loss
         self.log_ops["g_su_loss"] = g_su_loss
 
