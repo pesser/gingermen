@@ -108,6 +108,39 @@ class IndexFlow(object):
             batch_data = np.stack(batch_data)
             batch[k] = batch_data
 
+        # normalize scale
+        jo = self.index["joint_order"]
+        for i in range(batch["imgs"].shape[0]):
+            joints = batch["joints"][i]
+            lpath = ["lankle", "lknee", "lhip", "lshoulder", "lelbow", "lwrist"]
+            rpath = ["rankle", "rknee", "rhip", "rshoulder", "relbow", "rwrist"]
+            length = 0.0
+            for (a, b), (c,d) in zip(zip(lpath, lpath[1:]), zip(rpath,rpath[1:])):
+                lvec = joints[jo.index(b),:] - joints[jo.index(a),:]
+                rvec = joints[jo.index(d),:] - joints[jo.index(c),:]
+                length = length + max(np.linalg.norm(lvec), np.linalg.norm(rvec))
+            scale_factor = 1.0 * self.img_shape[0] / length
+            if scale_factor < 1:
+                rectsize = int(scale_factor * self.img_shape[0])
+                spacing = self.img_shape[0] - rectsize
+                hspacing = spacing // 2
+                x, y = hspacing, hspacing
+                w, h = rectsize, rectsize
+                src = np.float32([
+                    [0,0], [self.img_shape[1], 0],
+                    [0,self.img_shape[0]], [self.img_shape[1],self.img_shape[0]]])
+                dst = np.float32([
+                    [x, y], [x+w,y],
+                    [x, y+h], [x+w, y+h]])
+                M = cv2.getPerspectiveTransform(src, dst)
+                batch["imgs"][i] = cv2.warpPerspective(batch["imgs"][i], M, (self.img_shape[1], self.img_shape[0]), flags = cv2.INTER_LINEAR)
+                batch["masks"][i] = cv2.warpPerspective(batch["masks"][i], M, (self.img_shape[1], self.img_shape[0]), flags = cv2.INTER_LINEAR)
+                joints = np.expand_dims(joints, axis = 0)
+                joints = cv2.perspectiveTransform(joints, M)
+                joints = np.squeeze(joints)
+                batch["joints"][i] = joints
+
+
         # generate joint image
         jo = self.index["joint_order"]
         batch_data = list()
