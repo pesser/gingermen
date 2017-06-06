@@ -28,9 +28,10 @@ def init_logging():
     assert(this_file.endswith(".py"))
     shutil.copy(this_file, out_dir)
     # init logging
-    logging.basicConfig(
-            filename = os.path.join(out_dir, 'log.txt'),
-            level = logging.DEBUG)
+    logging.basicConfig(filename = os.path.join(out_dir, 'log.txt'))
+    global logger
+    logger = logging.getLogger(__name__)
+    logger.setLevel(logging.DEBUG)
 
 
 class BufferedWrapper(object):
@@ -87,7 +88,7 @@ class IndexFlow(object):
         self.index["joints"] = [v * self.img_shape[0] / 256 for v in self.index["joints"]]
 
         self.n = len(self.index["imgs"])
-        logging.info("Found {} images.".format(self.n))
+        logger.info("Found {} images.".format(self.n))
         self.shuffle()
 
 
@@ -270,7 +271,7 @@ class FileFlow(object):
         self.paths = paths
         self.fnames = fnames
         self.n = len(fnames)
-        logging.info("Found {} images.".format(self.n))
+        logger.info("Found {} images.".format(self.n))
         self.shuffle()
 
 
@@ -441,6 +442,14 @@ def tf_normalize(x):
             inputs = x,
             axis = -1,
             momentum = 0.9)
+
+
+def tf_repeat_spatially(x, spatial_shape):
+    xshape = x.get_shape().as_list()
+    assert(len(xshape) == 4)
+    assert(xshape[1] == 1 and xshape[2] == 1)
+    assert(len(spatial_shape) == 2)
+    return tf.tile(x, [1,spatial_shape[0],spatial_shape[1],1])
 
 
 smoothing1d = np.float32([1,2,1])
@@ -734,8 +743,8 @@ def make_style_enc(input_, power_features):
     vars_ = []
 
     maxf = 512
-    nblocks = 2
-    n_layers = 3
+    nblocks = 1
+    n_layers = 4
     latent_dim = 128
 
     n_features = min(maxf, 2**power_features)
@@ -771,6 +780,7 @@ class Model(object):
         self.log_frequency = 50
         self.ckpt_frequency = 500
         self.best_loss = float("inf")
+        self.style = True
         self.define_graph()
         self.restore_path = restore_path
         self.checkpoint_dir = os.path.join(out_dir, "checkpoints")
@@ -790,7 +800,7 @@ class Model(object):
 
     def make_u_enc(self, name):
         return make_model(name, make_u_enc,
-                n_layers = 5)
+                n_layers = 4)
 
 
     def make_u_dec(self, name):
@@ -839,7 +849,8 @@ class Model(object):
         g_tail_decs = dict(
                 (i, self.make_dec("generator_tail_{}".format(i)))
                 for i in g_output_streams)
-        g_style_enc = self.make_style_enc("generator_style_enc")
+        if self.style:
+            g_style_enc = self.make_style_enc("generator_style_enc")
 
         ## g training
         g_raw_inputs = [tf.placeholder(tf.uint8, shape = (None,) + self.img_shape) for i in range(n_domains)]
@@ -863,17 +874,24 @@ class Model(object):
             target = g_inputs[j]
             target_masked = mask * target
 
-            style_params = g_style_enc(target_masked)
-            style_zs, style_kl = ae_sampling(style_params, sample = True)
+            lat_loss = tf.to_float(0)
+            if self.style:
+                style_params = g_style_enc(target_masked)
+                style_zs, style_kl = ae_sampling(style_params, sample = True)
+                assert(len(style_zs) == 1)
+                style = tf_repeat_spatially(style_zs[0], self.img_shape[:2])
+                style = mask * style
+                #lat_loss = kl_weight*style_kl
+
+            input_ = tf.concat([input_, style], axis = -1)
 
             pose_zs = g_enc(g_head_encs[i](input_))
 
-            zs = pose_zs + style_zs
+            zs = pose_zs
             dec = g_tail_decs[j](g_dec(zs))
             #dec_masked = mask * dec
             dec_loss = ae_likelihood(target_masked, dec, loss = "h1")
 
-            lat_loss = kl_weight*style_kl
             g_su_loss += (dec_loss + lat_loss)/n
             self.img_ops["g_su_{}_{}".format(i,j)] = tf_postprocess(dec)
             #self.img_ops["g_su_{}_{}_masked".format(i,j)] = tf_postprocess(dec_masked)
@@ -890,23 +908,31 @@ class Model(object):
 
         # testing
         test_raw_inputs = tf.placeholder(tf.float32, shape = (None,) + self.img_shape)
+        test_raw_inputs_mask = tf.placeholder(tf.float32, shape = (None,) + self.img_shape)
         test_inputs = tf_preprocess(test_raw_inputs)
+        test_inputs_mask = tf_preprocess_mask(test_raw_inputs_mask)
         self.test_inputs = test_raw_inputs
+        self.test_inputs_mask = test_raw_inputs_mask
 
-        z_style_shape = style_zs[0].get_shape().as_list()[1:]
-        batch_style_shape = [tf.shape(test_inputs)[0]] + z_style_shape
+        if self.style:
+            z_style_shape = style_zs[0].get_shape().as_list()[1:]
+            batch_style_shape = [tf.shape(test_inputs)[0]] + z_style_shape
 
-        style_zs = [tf.random_normal(batch_style_shape, mean = 0.0, stddev = 1.0)]
+            style_zs = [tf.random_normal(batch_style_shape, mean = 0.0, stddev = 1.0)]
+            style = tf_repeat_spatially(style_zs[0], self.img_shape[:2])
+            style = test_inputs_mask * style
+            test_inputs = tf.concat([test_inputs, style], axis = -1)
         pose_zs = g_enc(g_head_encs[1](test_inputs))
 
-        zs = pose_zs + style_zs
+        zs = pose_zs
 
         dec = g_tail_decs[0](g_dec(zs))
         self.test_outputs = tf_postprocess(dec)
 
         # generator training
         g_trainable_weights = g_enc.trainable_weights + g_dec.trainable_weights
-        #g_trainable_weights += g_style_enc.trainable_weights
+        if self.style:
+            g_trainable_weights += g_style_enc.trainable_weights
         for i in g_input_streams:
             g_trainable_weights += g_head_encs[i].trainable_weights
         for i in g_output_streams:
@@ -929,7 +955,7 @@ class Model(object):
         self.saver = tf.train.Saver()
         if self.restore_path:
             self.saver.restore(session, restore_path)
-            logging.info("Restored model from {}".format(restore_path))
+            logger.info("Restored model from {}".format(restore_path))
         else:
             session.run(tf.global_variables_initializer())
 
@@ -959,7 +985,7 @@ class Model(object):
             self.writer.flush()
         if "log" in result:
             for k, v in result["log"].items():
-                logging.info("{}: {}".format(k, v))
+                logger.info("{}: {}".format(k, v))
         if "img" in result:
             for k, v in result["img"].items():
                 plot_images(v, k + "_{:07}".format(global_step))
@@ -982,15 +1008,16 @@ class Model(object):
                     plot_images(v, "valid_" + k + "_{:07}".format(global_step))
                 # checkpoint if validation loss improved
                 validation_loss = result["validation_loss"]
-                logging.info("{}: {}".format("validation_loss", validation_loss))
+                logger.info("{}: {}".format("validation_loss", validation_loss))
                 if validation_loss < self.best_loss:
-                    logging.info("step {}: Validation loss improved from {:.4e} to {:.4e}".format(global_step, self.best_loss, validation_loss))
+                    logger.info("step {}: Validation loss improved from {:.4e} to {:.4e}".format(global_step, self.best_loss, validation_loss))
                     self.best_loss = validation_loss
                     self.make_checkpoint(global_step, prefix = "best_")
             # testing
             if self.valid_batches is not None:
                 X_batch, Y_batch, Z_batch = next(self.valid_batches)
-                feed_dict = {self.test_inputs: Z_batch}
+                feed_dict = {self.test_inputs: Z_batch,
+                        self.test_inputs_mask: Y_batch}
                 test_outputs = session.run(self.test_outputs, feed_dict)
                 plot_images(test_outputs, "testing_{:07}".format(global_step))
         if global_step % self.ckpt_frequency == 0:
@@ -1003,7 +1030,7 @@ class Model(object):
                 session,
                 fname,
                 global_step = global_step)
-        logging.info("Saved model to {}".format(fname))
+        logger.info("Saved model to {}".format(fname))
 
 
     def test(self, test_batch):
@@ -1035,9 +1062,9 @@ if __name__ == "__main__":
 
     if mode == "train":
         batches = get_batches(img_shape, batch_size, os.path.join(opt.data_dir, "index.p"), train = True)
-        logging.info("Number of training samples: {}".format(batches.n))
+        logger.info("Number of training samples: {}".format(batches.n))
         valid_batches = get_batches(img_shape, batch_size, os.path.join(opt.data_dir, "index.p"), train = False)
-        logging.info("Number of validation samples: {}".format(valid_batches.n))
+        logger.info("Number of validation samples: {}".format(valid_batches.n))
         if valid_batches.n == 0:
             valid_batches = None
 
