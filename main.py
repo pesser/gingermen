@@ -723,6 +723,46 @@ def make_dec(input_, n_layers, out_channels = 3):
     return output
 
 
+def make_style_enc(input_, power_features):
+    # ops
+    conv_op = tf_conv
+    norm_op = tf_normalize
+    acti_op = lambda x: tf_activate(x, "leakyrelu")
+
+    # outputs
+    means = []
+    vars_ = []
+
+    maxf = 512
+    nblocks = 2
+    n_layers = 3
+    latent_dim = 128
+
+    n_features = min(maxf, 2**power_features)
+    features = input_
+    features = conv_op(features, 3, n_features, stride = 1)
+    for i in range(n_layers):
+        n_features = min(maxf, 2*n_features)
+        features = conv_op(features, 5, n_features, stride = 2)
+        features = norm_op(features)
+        features = acti_op(features)
+        for j in range(nblocks):
+            features = residual_block(features)
+    features = tf.contrib.layers.flatten(features)
+    # reintroduce spatial shape
+    features = tf.expand_dims(features, axis = 1)
+    features = tf.expand_dims(features, axis = 1)
+    print("lat shape: {}".format(features.get_shape().as_list()))
+
+    mean = conv_op(features, 1, latent_dim, stride = 1)
+    var_ = conv_op(features, 1, latent_dim, stride = 1)
+    var_ = tf_activate(var_, "softplus")
+    means.append(mean)
+    vars_.append(var_)
+
+    return means + vars_
+
+
 class Model(object):
     def __init__(self, img_shape, n_total_steps, restore_path = None):
         self.img_shape = img_shape
@@ -757,6 +797,11 @@ class Model(object):
         return make_model(name, make_u_dec)
 
 
+    def make_style_enc(self, name):
+        return make_model(name, make_style_enc,
+                power_features = 6)
+
+
     def define_graph(self):
         self.inputs = {}
         self.train_ops = {}
@@ -771,7 +816,7 @@ class Model(object):
         n_domains = 2
         kl_weight = make_linear_var(
                 step = global_step,
-                start = 100, end = 1000,
+                start = 250, end = 2000,
                 start_value = 0.0, end_value = 1.0,
                 clip_min = 1e-3, clip_max = 1.0)
         self.log_ops["kl_weight"] = kl_weight
@@ -794,6 +839,7 @@ class Model(object):
         g_tail_decs = dict(
                 (i, self.make_dec("generator_tail_{}".format(i)))
                 for i in g_output_streams)
+        g_style_enc = self.make_style_enc("generator_style_enc")
 
         ## g training
         g_raw_inputs = [tf.placeholder(tf.uint8, shape = (None,) + self.img_shape) for i in range(n_domains)]
@@ -815,13 +861,20 @@ class Model(object):
 
             input_ = g_inputs[i]
             target = g_inputs[j]
-            zs = g_enc(g_head_encs[i](input_))
+            target_masked = mask * target
+
+            style_params = g_style_enc(target_masked)
+            style_zs, style_kl = ae_sampling(style_params, sample = True)
+
+            pose_zs = g_enc(g_head_encs[i](input_))
+
+            zs = pose_zs + style_zs
             dec = g_tail_decs[j](g_dec(zs))
             #dec_masked = mask * dec
-            target_masked = mask * target
             dec_loss = ae_likelihood(target_masked, dec, loss = "h1")
 
-            g_su_loss += (dec_loss)/n
+            lat_loss = kl_weight*style_kl
+            g_su_loss += (dec_loss + lat_loss)/n
             self.img_ops["g_su_{}_{}".format(i,j)] = tf_postprocess(dec)
             #self.img_ops["g_su_{}_{}_masked".format(i,j)] = tf_postprocess(dec_masked)
             self.log_ops["g_su_loss_dec_{}_{}".format(i,j)] = dec_loss
@@ -839,7 +892,15 @@ class Model(object):
         test_raw_inputs = tf.placeholder(tf.float32, shape = (None,) + self.img_shape)
         test_inputs = tf_preprocess(test_raw_inputs)
         self.test_inputs = test_raw_inputs
-        zs = g_enc(g_head_encs[1](test_inputs))
+
+        z_style_shape = style_zs[0].get_shape().as_list()[1:]
+        batch_style_shape = [tf.shape(test_inputs)[0]] + z_style_shape
+
+        style_zs = [tf.random_normal(batch_style_shape, mean = 0.0, stddev = 1.0)]
+        pose_zs = g_enc(g_head_encs[1](test_inputs))
+
+        zs = pose_zs + style_zs
+
         dec = g_tail_decs[0](g_dec(zs))
         self.test_outputs = tf_postprocess(dec)
 
