@@ -826,7 +826,7 @@ class Model(object):
         n_domains = 2
         kl_weight = make_linear_var(
                 step = global_step,
-                start = 250, end = 2000,
+                start = 1500, end = 3000,
                 start_value = 0.0, end_value = 1.0,
                 clip_min = 1e-3, clip_max = 1.0)
         self.log_ops["kl_weight"] = kl_weight
@@ -881,7 +881,7 @@ class Model(object):
                 assert(len(style_zs) == 1)
                 style = tf_repeat_spatially(style_zs[0], self.img_shape[:2])
                 style = mask * style
-                #lat_loss = kl_weight*style_kl
+                lat_loss = kl_weight*style_kl
 
             input_ = tf.concat([input_, style], axis = -1)
 
@@ -915,10 +915,12 @@ class Model(object):
         self.test_inputs_mask = test_raw_inputs_mask
 
         if self.style:
-            z_style_shape = style_zs[0].get_shape().as_list()[1:]
-            batch_style_shape = [tf.shape(test_inputs)[0]] + z_style_shape
-
-            style_zs = [tf.random_normal(batch_style_shape, mean = 0.0, stddev = 1.0)]
+            z_style_shape = tuple(style_zs[0].get_shape().as_list()[1:])
+            self.z_style_shape = z_style_shape
+            self.test_style_input = tf.placeholder(tf.float32, shape = (None,) + self.z_style_shape)
+            #batch_style_shape = [tf.shape(test_inputs)[0]] + z_style_shape
+            #style_zs = [tf.random_normal(batch_style_shape, mean = 0.0, stddev = 1.0)]
+            style_zs = [self.test_style_input]
             style = tf_repeat_spatially(style_zs[0], self.img_shape[:2])
             style = test_inputs_mask * style
             test_inputs = tf.concat([test_inputs, style], axis = -1)
@@ -1015,9 +1017,28 @@ class Model(object):
                     self.make_checkpoint(global_step, prefix = "best_")
             # testing
             if self.valid_batches is not None:
+                if not hasattr(self, "test_batches"):
+                    self.test_batches = next(self.valid_batches)
+                    self.test_stickmen = np.repeat(self.test_batches[2][:10,...], 10, axis = 0)
+                    self.test_masks = np.repeat(self.test_batches[1][:10,...], 10, axis = 0)
+                    self.test_z_style = np.tile(np.random.standard_normal((10,) + self.z_style_shape), [10,1,1,1])
+
+                # test fixed samples
+                feed_dict = {
+                        self.test_inputs: self.test_stickmen,
+                        self.test_inputs_mask: self.test_masks,
+                        self.test_style_input: self.test_z_style}
+                test_outputs = session.run(self.test_outputs, feed_dict)
+                plot_images(test_outputs, "fixed_testing_{:07}".format(global_step))
+
+                # test random samples
                 X_batch, Y_batch, Z_batch = next(self.valid_batches)
-                feed_dict = {self.test_inputs: Z_batch,
-                        self.test_inputs_mask: Y_batch}
+                bs = X_batch.shape[0]
+                z_style_batch = np.random.standard_normal((bs,) + self.z_style_shape)
+                feed_dict = {
+                        self.test_inputs: Z_batch,
+                        self.test_inputs_mask: Y_batch,
+                        self.test_style_input: z_style_batch}
                 test_outputs = session.run(self.test_outputs, feed_dict)
                 plot_images(test_outputs, "testing_{:07}".format(global_step))
         if global_step % self.ckpt_frequency == 0:
