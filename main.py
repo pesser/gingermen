@@ -13,13 +13,10 @@ import pickle
 import cv2
 
 
-out_base_dir = os.path.join(os.getcwd(), "log")
-os.makedirs(out_base_dir, exist_ok = True)
-
-
-def init_logging():
+def init_logging(out_base_dir):
     # get unique output directory based on current time
     global out_dir
+    os.makedirs(out_base_dir, exist_ok = True)
     now = datetime.datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
     out_dir = os.path.join(out_base_dir, now)
     os.makedirs(out_dir, exist_ok = False)
@@ -76,23 +73,157 @@ def load_img(path, target_size):
     return x
 
 
+def make_joint_img(img_shape, jo, joints):
+    # three channels: left, right, center
+    imgs = list()
+    for i in range(3):
+        imgs.append(np.zeros(img_shape[:2], dtype = "uint8"))
+
+    if "chead" in jo:
+        # MPII
+        thickness = 3
+
+        body = ["lhip", "lshoulder", "rshoulder", "rhip"]
+        body_pts = np.array([[joints[jo.index(part),:] for part in body]])
+        if np.min(body_pts) >= 0:
+            body_pts = np.int_(body_pts)
+            cv2.fillPoly(imgs[2], body_pts, 255)
+
+        right_lines = [
+                ("rankle", "rknee"),
+                ("rknee", "rhip"),
+                ("rhip", "rshoulder"),
+                ("rshoulder", "relbow"),
+                ("relbow", "rwrist")]
+        for line in right_lines:
+            l = [jo.index(line[0]), jo.index(line[1])]
+            if np.min(joints[l]) >= 0:
+                a = tuple(np.int_(joints[l[0]]))
+                b = tuple(np.int_(joints[l[1]]))
+                cv2.line(imgs[0], a, b, color = 255, thickness = thickness)
+
+        left_lines = [
+                ("lankle", "lknee"),
+                ("lknee", "lhip"),
+                ("lhip", "lshoulder"),
+                ("lshoulder", "lelbow"),
+                ("lelbow", "lwrist")]
+        for line in left_lines:
+            l = [jo.index(line[0]), jo.index(line[1])]
+            if np.min(joints[l]) >= 0:
+                a = tuple(np.int_(joints[l[0]]))
+                b = tuple(np.int_(joints[l[1]]))
+                cv2.line(imgs[1], a, b, color = 255, thickness = thickness)
+
+        rs = joints[jo.index("rshoulder")]
+        ls = joints[jo.index("lshoulder")]
+        cn = joints[jo.index("chead")]
+        neck = 0.5*(rs+ls)
+        a = tuple(np.int_(neck))
+        b = tuple(np.int_(cn))
+        cv2.line(imgs[0], a, b, color = 127, thickness = thickness)
+        cv2.line(imgs[1], a, b, color = 127, thickness = thickness)
+    else:
+        assert("cnose" in jo)
+        # MSCOCO
+        body = ["lhip", "lshoulder", "rshoulder", "rhip"]
+        body_pts = np.array([[joints[jo.index(part),:] for part in body]])
+        if np.min(body_pts) >= 0:
+            body_pts = np.int_(body_pts)
+            cv2.fillPoly(imgs[2], body_pts, 255)
+
+        thickness = 3
+        right_lines = [
+                ("rankle", "rknee"),
+                ("rknee", "rhip"),
+                ("rhip", "rshoulder"),
+                ("rshoulder", "relbow"),
+                ("relbow", "rwrist")]
+        for line in right_lines:
+            l = [jo.index(line[0]), jo.index(line[1])]
+            if np.min(joints[l]) >= 0:
+                a = tuple(np.int_(joints[l[0]]))
+                b = tuple(np.int_(joints[l[1]]))
+                cv2.line(imgs[0], a, b, color = 255, thickness = thickness)
+
+        left_lines = [
+                ("lankle", "lknee"),
+                ("lknee", "lhip"),
+                ("lhip", "lshoulder"),
+                ("lshoulder", "lelbow"),
+                ("lelbow", "lwrist")]
+        for line in left_lines:
+            l = [jo.index(line[0]), jo.index(line[1])]
+            if np.min(joints[l]) >= 0:
+                a = tuple(np.int_(joints[l[0]]))
+                b = tuple(np.int_(joints[l[1]]))
+                cv2.line(imgs[1], a, b, color = 255, thickness = thickness)
+
+        rs = joints[jo.index("rshoulder")]
+        ls = joints[jo.index("lshoulder")]
+        cn = joints[jo.index("cnose")]
+        neck = 0.5*(rs+ls)
+        a = tuple(np.int_(neck))
+        b = tuple(np.int_(cn))
+        cv2.line(imgs[0], a, b, color = 127, thickness = thickness)
+        cv2.line(imgs[1], a, b, color = 127, thickness = thickness)
+
+    img = np.stack(imgs, axis = -1)
+    if img_shape[-1] == 1:
+        img = np.mean(img, axis = -1)[:,:,None]
+    return img
+
+
+def compute_scale_factor(img_shape, jo, joints):
+    lpath = ["lankle", "lknee", "lhip", "lshoulder", "lelbow", "lwrist"]
+    rpath = ["rankle", "rknee", "rhip", "rshoulder", "relbow", "rwrist"]
+    length = 0.0
+    for (a, b), (c,d) in zip(zip(lpath, lpath[1:]), zip(rpath,rpath[1:])):
+        lvec = joints[jo.index(b),:] - joints[jo.index(a),:]
+        rvec = joints[jo.index(d),:] - joints[jo.index(c),:]
+        length = length + max(np.linalg.norm(lvec), np.linalg.norm(rvec))
+    scale_factor = 1.0 * img_shape[0] / length
+    return scale_factor
+
+
+def compute_perspective_transform(img_shape, scale_factor):
+    rectsize = int(scale_factor * img_shape[0])
+    spacing = img_shape[0] - rectsize
+    hspacing = spacing // 2
+    x, y = hspacing, hspacing
+    w, h = rectsize, rectsize
+    src = np.float32([
+        [0,0], [img_shape[1], 0],
+        [0,img_shape[0]], [img_shape[1],img_shape[0]]])
+    dst = np.float32([
+        [x, y], [x+w,y],
+        [x, y+h], [x+w, y+h]])
+    M = cv2.getPerspectiveTransform(src, dst)
+    return M
+
+
 class IndexFlow(object):
     """Batches from index file."""
 
-    def __init__(self, batch_size, img_shape, index_path, train):
+    def __init__(self, batch_size, img_shape, index_path, train, test_only = False):
         self.batch_size = batch_size
         self.img_shape = img_shape
         with open(index_path, "rb") as f:
             self.index = pickle.load(f)
         self.train = train
         self.basepath = os.path.dirname(index_path)
+        self.test_only = test_only
 
-        for k in ["imgs", "masks", "joints"]:
-            self.index[k] = [v for i, v in enumerate(self.index[k]) if self.index["train"][i] == self.train]
+        if not self.test_only:
+            for k in ["imgs", "masks", "joints"]:
+                self.index[k] = [v for i, v in enumerate(self.index[k]) if self.index["train"][i] == self.train]
+        else:
+            assert("joints" in self.index and "joint_order" in self.index)
+
         self.index["joints"] = [v * self.img_shape[0] / 256 for v in self.index["joints"]]
 
-        self.n = len(self.index["imgs"])
-        logger.info("Found {} images.".format(self.n))
+        self.n = len(self.index["joints"])
+        logger.info("Found {} joints.".format(self.n))
         self.shuffle()
 
 
@@ -100,156 +231,46 @@ class IndexFlow(object):
         batch_start, batch_end = self.batch_start, self.batch_start + self.batch_size
         batch_indices = self.indices[batch_start:batch_end]
 
+        keys = ["joints"] if self.test_only else ["imgs", "masks", "joints"]
         batch = dict()
-        for k in ["imgs", "masks", "joints"]:
+        for k in keys:
             batch[k] = [self.index[k][i] for i in batch_indices]
 
-        # load image and mask
-        for k in ["imgs", "masks"]:
-            batch_data = list()
-            for fname in batch[k]:
-                path = os.path.join(self.basepath, fname)
-                batch_data.append(load_img(path, target_size = self.img_shape))
-            batch_data = np.stack(batch_data)
-            batch[k] = batch_data
+        if not self.test_only:
+            # load image and mask
+            for k in ["imgs", "masks"]:
+                batch_data = list()
+                for fname in batch[k]:
+                    path = os.path.join(self.basepath, fname)
+                    batch_data.append(load_img(path, target_size = self.img_shape))
+                batch_data = np.stack(batch_data)
+                batch[k] = batch_data
 
-        # normalize scale
+        # roughly normalize scale
         jo = self.index["joint_order"]
-        for i in range(batch["imgs"].shape[0]):
+        for i in range(len(batch["joints"])):
             joints = batch["joints"][i]
-            lpath = ["lankle", "lknee", "lhip", "lshoulder", "lelbow", "lwrist"]
-            rpath = ["rankle", "rknee", "rhip", "rshoulder", "relbow", "rwrist"]
-            length = 0.0
-            for (a, b), (c,d) in zip(zip(lpath, lpath[1:]), zip(rpath,rpath[1:])):
-                lvec = joints[jo.index(b),:] - joints[jo.index(a),:]
-                rvec = joints[jo.index(d),:] - joints[jo.index(c),:]
-                length = length + max(np.linalg.norm(lvec), np.linalg.norm(rvec))
-            scale_factor = 1.0 * self.img_shape[0] / length
+            scale_factor = compute_scale_factor(self.img_shape, jo, joints)
             if scale_factor < 1:
-                rectsize = int(scale_factor * self.img_shape[0])
-                spacing = self.img_shape[0] - rectsize
-                hspacing = spacing // 2
-                x, y = hspacing, hspacing
-                w, h = rectsize, rectsize
-                src = np.float32([
-                    [0,0], [self.img_shape[1], 0],
-                    [0,self.img_shape[0]], [self.img_shape[1],self.img_shape[0]]])
-                dst = np.float32([
-                    [x, y], [x+w,y],
-                    [x, y+h], [x+w, y+h]])
-                M = cv2.getPerspectiveTransform(src, dst)
-                batch["imgs"][i] = cv2.warpPerspective(batch["imgs"][i], M, (self.img_shape[1], self.img_shape[0]), flags = cv2.INTER_LINEAR)
-                batch["masks"][i] = cv2.warpPerspective(batch["masks"][i], M, (self.img_shape[1], self.img_shape[0]), flags = cv2.INTER_LINEAR)
+                M = compute_perspective_transform(self.img_shape, scale_factor)
                 joints = np.expand_dims(joints, axis = 0)
                 joints = cv2.perspectiveTransform(joints, M)
                 joints = np.squeeze(joints)
                 batch["joints"][i] = joints
+                if not self.test_only:
+                    img = cv2.warpPerspective(batch["imgs"][i], M, (self.img_shape[1], self.img_shape[0]), flags = cv2.INTER_LINEAR)
+                    mask = cv2.warpPerspective(batch["masks"][i], M, (self.img_shape[1], self.img_shape[0]), flags = cv2.INTER_LINEAR)
+                    if self.img_shape[-1] == 1:
+                        img = img[:,:,None]
+                        mask = mask[:,:,None]
+                    batch["imgs"][i] = img
+                    batch["masks"][i] = mask
 
-
-        # generate joint image
+        # generate stickmen
         jo = self.index["joint_order"]
         batch_data = list()
         for joints in batch["joints"]:
-            # three channels: left, right, center
-            imgs = list()
-            for i in range(3):
-                imgs.append(np.zeros(self.img_shape[:2], dtype = "uint8"))
-
-            if "chead" in jo:
-                thickness = 3
-
-                body = ["lhip", "lshoulder", "rshoulder", "rhip"]
-                body_pts = np.array([[joints[jo.index(part),:] for part in body]])
-                if np.min(body_pts) >= 0:
-                    body_pts = np.int_(body_pts)
-                    cv2.fillPoly(imgs[2], body_pts, 255)
-                """
-                head = ["lshoulder", "chead", "rshoulder"]
-                head_pts = np.array([[joints[jo.index(part),:] for part in head]])
-                if np.min(head_pts) >= 0:
-                    head_pts = np.int_(head_pts)
-                    cv2.fillPoly(imgs[0], head_pts, 127)
-                    cv2.fillPoly(imgs[1], head_pts, 127)
-                """
-
-                right_lines = [
-                        ("rankle", "rknee"),
-                        ("rknee", "rhip"),
-                        ("rhip", "rshoulder"),
-                        ("rshoulder", "relbow"),
-                        ("relbow", "rwrist")]
-                for line in right_lines:
-                    l = [jo.index(line[0]), jo.index(line[1])]
-                    if np.min(joints[l]) >= 0:
-                        a = tuple(np.int_(joints[l[0]]))
-                        b = tuple(np.int_(joints[l[1]]))
-                        cv2.line(imgs[0], a, b, color = 255, thickness = thickness)
-
-                left_lines = [
-                        ("lankle", "lknee"),
-                        ("lknee", "lhip"),
-                        ("lhip", "lshoulder"),
-                        ("lshoulder", "lelbow"),
-                        ("lelbow", "lwrist")]
-                for line in left_lines:
-                    l = [jo.index(line[0]), jo.index(line[1])]
-                    if np.min(joints[l]) >= 0:
-                        a = tuple(np.int_(joints[l[0]]))
-                        b = tuple(np.int_(joints[l[1]]))
-                        cv2.line(imgs[1], a, b, color = 255, thickness = thickness)
-
-                rs = joints[jo.index("rshoulder")]
-                ls = joints[jo.index("lshoulder")]
-                cn = joints[jo.index("chead")]
-                neck = 0.5*(rs+ls)
-                a = tuple(np.int_(neck))
-                b = tuple(np.int_(cn))
-                cv2.line(imgs[0], a, b, color = 127, thickness = thickness)
-                cv2.line(imgs[1], a, b, color = 127, thickness = thickness)
-            else:
-                body = ["lhip", "lshoulder", "rshoulder", "rhip"]
-                body_pts = np.array([[joints[jo.index(part),:] for part in body]])
-                if np.min(body_pts) >= 0:
-                    body_pts = np.int_(body_pts)
-                    cv2.fillPoly(imgs[2], body_pts, 255)
-
-                thickness = 3
-                right_lines = [
-                        ("rankle", "rknee"),
-                        ("rknee", "rhip"),
-                        ("rhip", "rshoulder"),
-                        ("rshoulder", "relbow"),
-                        ("relbow", "rwrist")]
-                for line in right_lines:
-                    l = [jo.index(line[0]), jo.index(line[1])]
-                    if np.min(joints[l]) >= 0:
-                        a = tuple(np.int_(joints[l[0]]))
-                        b = tuple(np.int_(joints[l[1]]))
-                        cv2.line(imgs[0], a, b, color = 255, thickness = thickness)
-
-                left_lines = [
-                        ("lankle", "lknee"),
-                        ("lknee", "lhip"),
-                        ("lhip", "lshoulder"),
-                        ("lshoulder", "lelbow"),
-                        ("lelbow", "lwrist")]
-                for line in left_lines:
-                    l = [jo.index(line[0]), jo.index(line[1])]
-                    if np.min(joints[l]) >= 0:
-                        a = tuple(np.int_(joints[l[0]]))
-                        b = tuple(np.int_(joints[l[1]]))
-                        cv2.line(imgs[1], a, b, color = 255, thickness = thickness)
-
-                rs = joints[jo.index("rshoulder")]
-                ls = joints[jo.index("lshoulder")]
-                cn = joints[jo.index("cnose")]
-                neck = 0.5*(rs+ls)
-                a = tuple(np.int_(neck))
-                b = tuple(np.int_(cn))
-                cv2.line(imgs[0], a, b, color = 127, thickness = thickness)
-                cv2.line(imgs[1], a, b, color = 127, thickness = thickness)
-
-            img = np.stack(imgs, axis = -1)
+            img = make_joint_img(self.img_shape, jo, joints)
             batch_data.append(img)
         batch["joints"] = np.stack(batch_data)
 
@@ -258,7 +279,10 @@ class IndexFlow(object):
         else:
             self.batch_start = batch_end
 
-        return batch["imgs"], batch["masks"], batch["joints"]
+        if self.test_only:
+            return batch["joints"]
+        else:
+            return batch["imgs"], batch["masks"], batch["joints"]
 
 
     def shuffle(self):
@@ -266,7 +290,7 @@ class IndexFlow(object):
         self.indices = np.random.permutation(self.n)
 
 
-def get_batches(img_shape, batch_size, path, train):
+def get_batches(img_shape, batch_size, path, train = True, test_only = False):
     """Buffered IndexFlow."""
     flow = IndexFlow(batch_size, img_shape, path, train)
     return BufferedWrapper(flow)
@@ -548,18 +572,18 @@ def make_model(name, run, **kwargs):
     return TFModel(name, runl)
 
 
-def residual_block(input_):
+def residual_block(input_, n_layers = 2):
     """Residual block."""
     n_features = input_.get_shape().as_list()[-1]
     residual = input_
-    for i in range(2):
+    for i in range(n_layers):
         residual = tf_normalize(residual)
         residual = tf_activate(residual, "leakyrelu")
         residual = tf_conv(residual, 3, n_features)
     return input_ + residual
 
 
-def make_u_enc(input_, n_layers):
+def make_u_enc(input_, n_layers, maxf):
     """U-Encoder"""
     # ops
     conv_op = tf_conv
@@ -571,7 +595,6 @@ def make_u_enc(input_, n_layers):
     zs = []
 
     pf = np.log2(input_.get_shape().as_list()[-1])
-    maxf = 512
     nblocks = 1
 
     features = input_
@@ -600,7 +623,7 @@ def by_shape(inputs):
     return bs
 
 
-def make_u_dec(inputs):
+def make_u_dec(inputs, maxf):
     """U-Decoder that takes arbitrary inputs (all with shape in power of
     two) and concatenates them with successively upsampling decodings.
     Output shape is determined by first input with maximum spatial shape."""
@@ -616,10 +639,9 @@ def make_u_dec(inputs):
     n_layers = int(np.log2(max_shape/min_shape))
 
     pf = np.log2(in_by_shape[max_shape][0].get_shape().as_list()[-1])
-    maxf = 512
     nblocks = 1
 
-    print(in_by_shape)
+    logger.info("U-Decoder in_by_shape: {}".format(in_by_shape))
     fshapes = []
     # build top down
     for l in reversed(range(n_layers)):
@@ -636,19 +658,18 @@ def make_u_dec(inputs):
         features = norm_op(features)
         features = acti_op(features)
         fshapes.append(features.get_shape().as_list())
-    print(fshapes)
+    logger.info("U-Decoder fshapes: {}".format(fshapes))
 
     return features
 
 
-def make_enc(input_, power_features, n_layers):
+def make_enc(input_, power_features, n_layers, maxf):
     """Encoder."""
     # ops
     conv_op = tf_conv
     norm_op = tf_normalize
     acti_op = lambda x: tf_activate(x, "leakyrelu")
 
-    maxf = 512
     nblocks = 1
 
     n_features = min(maxf, 2**power_features)
@@ -661,12 +682,12 @@ def make_enc(input_, power_features, n_layers):
         features = acti_op(features)
         for j in range(nblocks):
             features = residual_block(features)
-    print("enc out: {}".format(features.get_shape().as_list()))
+    logger.info("Encoder out: {}".format(features.get_shape().as_list()))
 
     return features
 
 
-def make_dec(input_, n_layers, out_channels = 3):
+def make_dec(input_, n_layers, maxf, out_channels):
     """Decoder."""
     # ops
     conv_op = tf_conv_transposed
@@ -674,13 +695,12 @@ def make_dec(input_, n_layers, out_channels = 3):
     acti_op = lambda x: tf_activate(x, "leakyrelu")
     tanh_op = lambda x: tf_activate(x, "tanh")
 
-    maxf = 512
     nblocks = 1
 
     # build top down
     n_features = input_.get_shape().as_list()[-1]
     features = input_
-    print("dec in: {}".format(features.get_shape().as_list()))
+    logger.info("Decoder in: {}".format(features.get_shape().as_list()))
     for l in reversed(range(n_layers)):
         for j in range(nblocks):
             features = residual_block(features)
@@ -696,7 +716,7 @@ def make_dec(input_, n_layers, out_channels = 3):
     return output
 
 
-def make_style_enc(input_, power_features):
+def make_style_enc(input_, power_features, maxf):
     # ops
     conv_op = tf_conv
     norm_op = tf_normalize
@@ -706,7 +726,6 @@ def make_style_enc(input_, power_features):
     means = []
     vars_ = []
 
-    maxf = 512
     nblocks = 1
     n_layers = 4
     latent_dim = 128
@@ -725,7 +744,7 @@ def make_style_enc(input_, power_features):
     # reintroduce spatial shape
     features = tf.expand_dims(features, axis = 1)
     features = tf.expand_dims(features, axis = 1)
-    print("lat shape: {}".format(features.get_shape().as_list()))
+    logger.info("Style encoder latent shape: {}".format(features.get_shape().as_list()))
 
     mean = conv_op(features, 1, latent_dim, stride = 1)
     var_ = conv_op(features, 1, latent_dim, stride = 1)
@@ -737,43 +756,47 @@ def make_style_enc(input_, power_features):
 
 
 class Model(object):
-    def __init__(self, img_shape, n_total_steps, restore_path = None):
-        self.img_shape = img_shape
-        self.lr = 1e-4
-        self.n_total_steps = n_total_steps
-        self.log_frequency = 50
-        self.ckpt_frequency = 500
+    def __init__(self, opt):
+        self.img_shape = tuple(2*[opt.spatial_size] + [1 if opt.grayscale else 3])
+        self.lr = opt.lr
+        self.log_frequency = opt.log_freq
+        self.ckpt_frequency = opt.ckpt_freq
+        self.style = opt.style
+        self.restore_path = opt.checkpoint
+        self.maxf = opt.maxf
+        self.kl_start = opt.kl_start
+        self.kl_end = opt.kl_end
+
         self.best_loss = float("inf")
-        self.style = True
-        self.define_graph()
-        self.restore_path = restore_path
         self.checkpoint_dir = os.path.join(out_dir, "checkpoints")
         os.makedirs(self.checkpoint_dir, exist_ok = True)
+
+        self.define_graph()
         self.init_graph()
 
 
     def make_enc(self, name):
         return make_model(name, make_enc,
-                power_features = 6, n_layers = 0)
+                power_features = 6, n_layers = 0, maxf = self.maxf)
 
 
     def make_dec(self, name):
         return make_model(name, make_dec,
-                n_layers = 0)
+                n_layers = 0, maxf = self.maxf, out_channels = self.img_shape[-1])
 
 
     def make_u_enc(self, name):
         return make_model(name, make_u_enc,
-                n_layers = 3)
+                n_layers = 3, maxf = self.maxf)
 
 
     def make_u_dec(self, name):
-        return make_model(name, make_u_dec)
+        return make_model(name, make_u_dec, maxf = self.maxf)
 
 
     def make_style_enc(self, name):
         return make_model(name, make_style_enc,
-                power_features = 6)
+                power_features = 6, maxf = self.maxf)
 
 
     def define_graph(self):
@@ -787,16 +810,19 @@ class Model(object):
         global_step = tf.Variable(0, trainable = False, name = "global_step")
         self.log_ops["global_step"] = global_step
 
-        n_domains = 2
+        # warm start without kl loss then gradually increase
+        assert(self.kl_start < self.kl_end)
         kl_weight = make_linear_var(
                 step = global_step,
-                start = 1500, end = 3000,
+                start = self.kl_start, end = self.kl_end,
                 start_value = 0.0, end_value = 1.0,
                 clip_min = 1e-3, clip_max = 1.0)
         self.log_ops["kl_weight"] = kl_weight
 
         # adjacency matrix of active streams with (i,j) indicating stream
         # from domain i to domain j
+        # this used to be a UNIT network, now only stream (1,0) is supported
+        n_domains = 2
         g_streams = np.zeros((n_domains, n_domains), dtype = np.bool)
         g_streams[1,0] = True
         g_auto_streams = g_streams & (np.eye(n_domains, dtype = np.bool))
@@ -816,16 +842,16 @@ class Model(object):
         if self.style:
             g_style_enc = self.make_style_enc("generator_style_enc")
 
-        ## g training
-        g_raw_inputs = [tf.placeholder(tf.uint8, shape = (None,) + self.img_shape) for i in range(n_domains)]
-        g_inputs = [tf_preprocess(x) for x in g_raw_inputs]
-        self.inputs["g_inputs"] = g_raw_inputs
+        # inputs
+        self.inputs["g_inputs"] = [tf.placeholder(tf.uint8, shape = (None,) + self.img_shape) for i in range(n_domains)]
+        g_inputs = [tf_preprocess(x) for x in self.inputs["g_inputs"]]
         self.inputs["mask"] = tf.placeholder(tf.uint8, shape = (None,) + self.img_shape)
         mask = tf_preprocess_mask(self.inputs["mask"])
+
         for i in range(len(g_inputs)):
             self.img_ops["g_inputs_{}".format(i)] = tf_postprocess(g_inputs[i])
             self.img_ops["g_inputs_{}_masked".format(i)] = tf_postprocess(mask * g_inputs[i])
-            #self.img_ops["g_inputs_{}_edges".format(i)] = tf_postprocess(tf_grad_mag(g_inputs[i]))
+            self.img_ops["g_inputs_{}_masked_edges".format(i)] = tf_postprocess(tf_grad_mag(mask * g_inputs[i]))
         self.img_ops["mask"] = tf_postprocess_mask(mask)
 
         # supervised translation
@@ -840,25 +866,24 @@ class Model(object):
 
             lat_loss = tf.to_float(0)
             if self.style:
+                # infer latent style
                 style_params = g_style_enc(target_masked)
+                #style_params = g_style_enc(target)
                 style_zs, style_kl = ae_sampling(style_params, sample = True)
                 assert(len(style_zs) == 1)
                 style = tf_repeat_spatially(style_zs[0], self.img_shape[:2])
-                style = mask * style
+                #style = mask * style - avoid mask during testing
                 lat_loss = kl_weight*style_kl
+                # combine latent style with pose conditioning
+                input_ = tf.concat([input_, style], axis = -1)
 
-            input_ = tf.concat([input_, style], axis = -1)
-
-            pose_zs = g_enc(g_head_encs[i](input_))
-
-            zs = pose_zs
+            zs = g_enc(g_head_encs[i](input_))
             dec = g_tail_decs[j](g_dec(zs))
-            #dec_masked = mask * dec
             dec_loss = ae_likelihood(target_masked, dec, loss = "h1")
 
             g_su_loss += (dec_loss + lat_loss)/n
             self.img_ops["g_su_{}_{}".format(i,j)] = tf_postprocess(dec)
-            #self.img_ops["g_su_{}_{}_masked".format(i,j)] = tf_postprocess(dec_masked)
+            self.img_ops["g_su_{}_{}_edges".format(i,j)] = tf_postprocess(tf_grad_mag(dec))
             self.log_ops["g_su_loss_dec_{}_{}".format(i,j)] = dec_loss
         self.log_ops["g_su_loss"] = g_su_loss
 
@@ -867,31 +892,24 @@ class Model(object):
         self.log_ops["g_loss"] = g_loss
 
         # overall loss used for checkpointing
-        loss = g_loss
-        self.log_ops["loss"] = loss
+        self.log_ops["loss"] = g_loss
 
         # testing
-        test_raw_inputs = tf.placeholder(tf.float32, shape = (None,) + self.img_shape)
-        test_raw_inputs_mask = tf.placeholder(tf.float32, shape = (None,) + self.img_shape)
-        test_inputs = tf_preprocess(test_raw_inputs)
-        test_inputs_mask = tf_preprocess_mask(test_raw_inputs_mask)
-        self.test_inputs = test_raw_inputs
-        self.test_inputs_mask = test_raw_inputs_mask
+        self.test_inputs = tf.placeholder(tf.float32, shape = (None,) + self.img_shape)
+        test_inputs = tf_preprocess(self.test_inputs)
+        #self.test_inputs_mask = tf.placeholder(tf.float32, shape = (None,) + self.img_shape) - avoid mask during testing
+        #test_inputs_mask = tf_preprocess_mask(self.test_inputs_mask) - avoid mask during testing
 
         if self.style:
             z_style_shape = tuple(style_zs[0].get_shape().as_list()[1:])
             self.z_style_shape = z_style_shape
-            self.test_style_input = tf.placeholder(tf.float32, shape = (None,) + self.z_style_shape)
             #batch_style_shape = [tf.shape(test_inputs)[0]] + z_style_shape
-            #style_zs = [tf.random_normal(batch_style_shape, mean = 0.0, stddev = 1.0)]
-            style_zs = [self.test_style_input]
-            style = tf_repeat_spatially(style_zs[0], self.img_shape[:2])
-            style = test_inputs_mask * style
+            #style_zs = [tf.random_normal(batch_style_shape, mean = 0.0, stddev = 1.0)] - take latent style as input for better control
+            self.test_style_input = tf.placeholder(tf.float32, shape = (None,) + self.z_style_shape)
+            style = tf_repeat_spatially(self.test_style_input, self.img_shape[:2])
+            #style = test_inputs_mask * style - avoid mask during testing
             test_inputs = tf.concat([test_inputs, style], axis = -1)
-        pose_zs = g_enc(g_head_encs[1](test_inputs))
-
-        zs = pose_zs
-
+        zs = g_enc(g_head_encs[1](test_inputs))
         dec = g_tail_decs[0](g_dec(zs))
         self.test_outputs = tf_postprocess(dec)
 
@@ -920,16 +938,15 @@ class Model(object):
                 session.graph)
         self.saver = tf.train.Saver()
         if self.restore_path:
-            self.saver.restore(session, restore_path)
-            logger.info("Restored model from {}".format(restore_path))
+            self.saver.restore(session, self.restore_path)
+            logger.info("Restored model from {}".format(self.restore_path))
         else:
             session.run(tf.global_variables_initializer())
 
 
-    def fit(self, batches, valid_batches = None):
+    def fit(self, steps, batches, valid_batches = None):
         self.valid_batches = valid_batches
-        for batch in trange(self.n_total_steps):
-            #X1_batch, Y1_batch = next(batches)
+        for batch in trange(steps):
             X_batch, Y_batch, Z_batch = next(batches)
             feed_dict = {
                     self.inputs["mask"]: Y_batch,
@@ -984,25 +1001,28 @@ class Model(object):
                 if not hasattr(self, "test_batches"):
                     self.test_batches = next(self.valid_batches)
                     self.test_stickmen = np.repeat(self.test_batches[2][:10,...], 10, axis = 0)
-                    self.test_masks = np.repeat(self.test_batches[1][:10,...], 10, axis = 0)
-                    self.test_z_style = np.tile(np.random.standard_normal((10,) + self.z_style_shape), [10,1,1,1])
+                    #self.test_masks = np.repeat(self.test_batches[1][:10,...], 10, axis = 0) - avoid mask during testing
+                    if self.style:
+                        self.test_z_style = np.tile(np.random.standard_normal((10,) + self.z_style_shape), [10,1,1,1])
 
                 # test fixed samples
                 feed_dict = {
-                        self.test_inputs: self.test_stickmen,
-                        self.test_inputs_mask: self.test_masks,
-                        self.test_style_input: self.test_z_style}
+                        self.test_inputs: self.test_stickmen}
+                        #self.test_inputs_mask: self.test_masks, - avoid mask during testing
+                if self.style:
+                        feed_dict[self.test_style_input] = self.test_z_style
                 test_outputs = session.run(self.test_outputs, feed_dict)
                 plot_images(test_outputs, "fixed_testing_{:07}".format(global_step))
 
                 # test random samples
                 X_batch, Y_batch, Z_batch = next(self.valid_batches)
-                bs = X_batch.shape[0]
-                z_style_batch = np.random.standard_normal((bs,) + self.z_style_shape)
                 feed_dict = {
-                        self.test_inputs: Z_batch,
-                        self.test_inputs_mask: Y_batch,
-                        self.test_style_input: z_style_batch}
+                        self.test_inputs: Z_batch}
+                        #self.test_inputs_mask: Y_batch, - avoid mask during testing
+                if self.style:
+                    bs = X_batch.shape[0]
+                    z_style_batch = np.random.standard_normal((bs,) + self.z_style_shape)
+                    feed_dict[self.test_style_input] = z_style_batch
                 test_outputs = session.run(self.test_outputs, feed_dict)
                 plot_images(test_outputs, "testing_{:07}".format(global_step))
         if global_step % self.ckpt_frequency == 0:
@@ -1020,52 +1040,68 @@ class Model(object):
 
     def test(self, test_batch):
             feed_dict = {self.test_inputs: test_batch}
+            if self.style:
+                bs = test_batch.shape[0]
+                z_style_batch = np.random.standard_normal((bs,) + self.z_style_shape)
+                feed_dict[self.test_style_input] = z_style_batch
             test_outputs = session.run(self.test_outputs, feed_dict)
             return test_outputs
 
 
 if __name__ == "__main__":
+    default_log_dir = os.path.join(os.getcwd(), "log")
+
     parser = argparse.ArgumentParser()
     parser.add_argument("--mode", default = "train", choices=["train", "test"])
-    parser.add_argument("--data_dir", required = True, help = "path to training or testing data")
+    parser.add_argument("--data_index", required = True, help = "path to training or testing data index")
+    parser.add_argument("--log_dir", default = default_log_dir, help = "path to log into")
     parser.add_argument("--batch_size", default = 32)
-    parser.add_argument("--n_epochs", default = 100)
+    parser.add_argument("--n_epochs", default = 50)
     parser.add_argument("--checkpoint", help = "path to checkpoint to restore")
+    parser.add_argument("--spatial_size", default = 128, help = "spatial size to resize images to")
+    parser.add_argument("--grayscale", dest = "grayscale", action = "store_true", help = "work with grayscale images")
+    parser.set_defaults(grayscale = False)
+    parser.add_argument("--lr", default = 1e-4, help = "learning rate")
+    parser.add_argument("--log_freq", default = 50, help = "frequency to log")
+    parser.add_argument("--ckpt_freq", default = 500, help = "frequency to checkpoint")
+    parser.add_argument("--maxf", default = 256, help = "Maximum size of feature maps")
+    parser.add_argument("--no-style", dest = "style", action = "store_false", help = "Do not use style encoder")
+    parser.set_defaults(style = True)
+    parser.add_argument("--kl_start", default = 1000, help = "Steps after which to start kl loss for style encoder")
+    parser.add_argument("--kl_end", default = 3000, help = "Steps after which to use full kl loss for style encoder")
     opt = parser.parse_args()
 
-    if not os.path.isdir(opt.data_dir):
-        raise Exception("Invalid data dir: {}".format(opt.data_dir))
+    if not os.path.exists(opt.data_index):
+        raise Exception("Invalid data index: {}".format(opt.data_index))
+
+    init_logging(opt.log_dir)
+    logger.info(opt)
 
     batch_size = opt.batch_size
-    restore_path = opt.checkpoint
     n_epochs = opt.n_epochs
     mode = opt.mode
-
-    img_shape = (128, 128, 3)
-
-    init_logging()
+    img_shape = 2*[opt.spatial_size] + [1 if opt.grayscale else 3]
 
     if mode == "train":
-        batches = get_batches(img_shape, batch_size, os.path.join(opt.data_dir, "index.p"), train = True)
+        batches = get_batches(img_shape, batch_size, opt.data_index, train = True)
         logger.info("Number of training samples: {}".format(batches.n))
-        valid_batches = get_batches(img_shape, batch_size, os.path.join(opt.data_dir, "index.p"), train = False)
+        valid_batches = get_batches(img_shape, batch_size, opt.data_index, train = False)
         logger.info("Number of validation samples: {}".format(valid_batches.n))
         if valid_batches.n == 0:
             valid_batches = None
 
         n_total_steps = int(n_epochs * batches.n / batch_size)
-        model = Model(img_shape, n_total_steps, restore_path)
-        model.fit(batches, valid_batches)
+        model = Model(opt)
+        model.fit(n_total_steps, batches, valid_batches)
     else:
-        # TODO
-        model = Model(img_shape, 0, restore_path)
-        if not restore_path:
+        if not opt.checkpoint:
             raise Exception("Testing requires --checkpoint")
-        test_batches = get_batches(img_shape, batch_size, [opt.data_dir])
+        model = Model(opt)
+        test_batches = get_batches(img_shape, batch_size, opt.data_index, test_only = True)
         n_batches = int(math.ceil(test_batches.n / batch_size))
         idx = 0
         for i in trange(n_batches):
-            test_batch, = next(test_batches)
+            test_batch = next(test_batches)
             test_results = model.test(test_batch)
             for j in range(test_results.shape[0]):
                 save_image(test_batch[j,...], "{:07}_input".format(idx))
