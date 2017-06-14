@@ -55,6 +55,8 @@ class BufferedWrapper(object):
 
 
 def load_img(path, target_size):
+    """Load image. target_size is specified as (height, width, channels)
+    where channels == 1 means grayscale. uint8 image returned."""
     img = PIL.Image.open(path)
     grayscale = target_size[2] == 1
     if grayscale:
@@ -75,6 +77,8 @@ def load_img(path, target_size):
 
 
 class IndexFlow(object):
+    """Batches from index file."""
+
     def __init__(self, batch_size, img_shape, index_path, train):
         self.batch_size = batch_size
         self.img_shape = img_shape
@@ -262,48 +266,8 @@ class IndexFlow(object):
         self.indices = np.random.permutation(self.n)
 
 
-class FileFlow(object):
-    def __init__(self, batch_size, img_shape, paths):
-        fnames = list(set(fname for fname in os.listdir(path) if fname.endswith(".jpg")) for path in paths)
-        fnames = list(functools.reduce(lambda a, b: a & b, fnames))
-        self.batch_size = batch_size
-        self.img_shape = img_shape
-        self.paths = paths
-        self.fnames = fnames
-        self.n = len(fnames)
-        logger.info("Found {} images.".format(self.n))
-        self.shuffle()
-
-
-    def __next__(self):
-        batch_start, batch_end = self.batch_start, self.batch_start + self.batch_size
-        # do
-        batch_indices = self.indices[batch_start:batch_end]
-        batch_fnames = [self.fnames[i] for i in batch_indices]
-
-        current_batch_size = len(batch_fnames)
-        batches = []
-        for path in self.paths:
-            path_batch = np.zeros((current_batch_size,) + self.img_shape, dtype = "uint8")
-            for i, fname in enumerate(batch_fnames):
-                x = load_img(os.path.join(path, fname), target_size = self.img_shape)
-                path_batch[i] = x
-            batches.append(path_batch)
-
-        if batch_end > self.n:
-            self.shuffle()
-        else:
-            self.batch_start = batch_end
-
-        return batches
-
-
-    def shuffle(self):
-        self.batch_start = 0
-        self.indices = np.random.permutation(self.n)
-
-
 def get_batches(img_shape, batch_size, path, train):
+    """Buffered IndexFlow."""
     flow = IndexFlow(batch_size, img_shape, path, train)
     return BufferedWrapper(flow)
 
@@ -324,13 +288,13 @@ def tile(X, rows, cols):
 
 
 def save_image(X, name):
+    """Save image as png."""
     fname = os.path.join(out_dir, name + ".png")
     PIL.Image.fromarray(X).save(fname)
 
 
 def plot_images(X, name):
-    #X = (X + 1.0) / 2.0
-    #X = np.clip(X, 0.0, 1.0)
+    """Save batch of images tiled."""
     rc = math.sqrt(X.shape[0])
     rows = cols = math.ceil(rc)
     canvas = tile(X, rows, cols)
@@ -344,8 +308,8 @@ def make_linear_var(
         start, end,
         start_value, end_value,
         clip_min = 0.0, clip_max = 1.0):
-    # linear from (a, alpha) to (b, beta)
-    # (beta - alpha)/(b - a) * (x - a) + alpha
+    """linear from (a, alpha) to (b, beta), i.e.
+    (beta - alpha)/(b - a) * (x - a) + alpha"""
     linear = (
             (end_value - start_value) /
             (end - start) *
@@ -353,32 +317,13 @@ def make_linear_var(
     return tf.clip_by_value(linear, clip_min, clip_max)
 
 
-def split_batch(batch):
-    batch_a = []
-    batch_b = []
-
-    bsize = batch[0].shape[0]
-    is_even = (bsize % 2 == 0)
-    if is_even:
-        new_bsize = bsize
-    else:
-        new_bsize = bsize - 1
-    middle = new_bsize // 2
-    for d in batch:
-        assert(d.shape[0] == bsize)
-        d = d[:new_bsize]
-        d_a = d[:middle]
-        d_b = d[middle:]
-        batch_a.append(d_a)
-        batch_b.append(d_b)
-    return batch_a, batch_b
-
-
 def tf_preprocess(x):
+    """Convert uint8 image to [-1,1]"""
     return tf.cast(x, tf.float32) / 127.5 - 1.0
 
 
 def tf_preprocess_mask(x):
+    """Convert uint8 mask to [0,1] and combine channels."""
     mask = tf.cast(x, tf.float32) / 255.0
     if mask.get_shape().as_list()[-1] == 3:
         mask = tf.reduce_max(mask, axis = -1, keep_dims = True)
@@ -386,6 +331,7 @@ def tf_preprocess_mask(x):
 
 
 def tf_postprocess(x):
+    """Convert image in [-1,1] to uint8 image."""
     x = (x + 1.0) / 2.0
     x = tf.clip_by_value(255 * x, 0, 255)
     x = tf.cast(x, tf.uint8)
@@ -393,16 +339,19 @@ def tf_postprocess(x):
 
 
 def tf_postprocess_mask(x):
+    """Convert mask in [0,1] to uint8 mask."""
     x = tf.clip_by_value(255 * x, 0, 255)
     x = tf.cast(x, tf.uint8)
     return x
 
 
 def tf_corrupt(x, eps):
+    """Additive gaussian noise with stddev of eps."""
     return x + eps * tf.random_normal(tf.shape(x), mean = 0.0, stddev = 1.0)
 
 
 def tf_conv(x, kernel_size, filters, stride = 1):
+    """2D Convolution."""
     return tf.layers.conv2d(
             inputs = x,
             filters = filters,
@@ -413,6 +362,7 @@ def tf_conv(x, kernel_size, filters, stride = 1):
 
 
 def tf_conv_transposed(x, kernel_size, filters, stride = 1):
+    """2D Transposed Convolution."""
     return tf.layers.conv2d_transpose(
             inputs = x,
             filters = filters,
@@ -423,6 +373,7 @@ def tf_conv_transposed(x, kernel_size, filters, stride = 1):
 
 
 def tf_activate(x, activation):
+    """Different activation functions."""
     if activation == "leakyrelu":
         return tf.maximum(0.2*x, x)
     elif activation == "softplus":
@@ -434,10 +385,12 @@ def tf_activate(x, activation):
 
 
 def tf_concatenate(x):
+    """Concatenate along feature axis, i.e. last axis."""
     return tf.concat(x, axis = -1)
 
 
 def tf_normalize(x):
+    """Batch normalization."""
     return tf.layers.batch_normalization(
             inputs = x,
             axis = -1,
@@ -445,6 +398,7 @@ def tf_normalize(x):
 
 
 def tf_repeat_spatially(x, spatial_shape):
+    """Replicate features of shape (b,1,1,c) to (b,spatial_shape,c)."""
     xshape = x.get_shape().as_list()
     assert(len(xshape) == 4)
     assert(xshape[1] == 1 and xshape[2] == 1)
@@ -462,6 +416,7 @@ sobely = sobely[:,:,None]
 # stack along new dim for output channels
 sobel = np.stack([sobelx, sobely], axis = -1)
 def tf_img_grad(x):
+    """Sobel approximation of gradient."""
     gray = tf.reduce_mean(x, axis = -1, keep_dims = True)
     grad = tf.nn.conv2d(
             input = gray,
@@ -472,12 +427,14 @@ def tf_img_grad(x):
 
 
 def tf_grad_loss(x, y):
+    """L2 difference of gradients."""
     gx = tf_img_grad(x)
     gy = tf_img_grad(y)
     return tf.reduce_mean(tf.contrib.layers.flatten(tf.square(gx - gy)))
 
 
 def tf_grad_mag(x):
+    """Pointwise L2 norm of gradient."""
     gx = tf_img_grad(x)
     return tf.sqrt(tf.reduce_sum(tf.square(gx), axis = -1, keep_dims = True))
 
@@ -501,7 +458,7 @@ def ae_infer_x(input_, dec, tail_dec):
     return tail_decoding
 
 
-def ae_likelihood(target, tail_decoding, loss = "h1"):
+def ae_likelihood(target, tail_decoding, loss):
     if loss == "l2":
         rec_loss = tf.reduce_mean(tf.contrib.layers.flatten(
             tf.square(target - tail_decoding)))
@@ -556,6 +513,9 @@ def ae_sampling(encodings, sample = False):
 
 
 class TFModel(object):
+    """Initialize variables on first call, then reuse on subsequent
+    calls."""
+
     def __init__(self, name, run, input_shapes = None):
         self.name = name
         self.run = run
@@ -578,15 +538,18 @@ class TFModel(object):
 
     @property
     def trainable_weights(self):
+        """Trainable variables associated with this model."""
         return tf.get_collection(tf.GraphKeys.TRAINABLE_VARIABLES, scope = self.name)
 
 
 def make_model(name, run, **kwargs):
+    """Create model with fixed kwargs."""
     runl = lambda x: run(x, **kwargs)
     return TFModel(name, runl)
 
 
 def residual_block(input_):
+    """Residual block."""
     n_features = input_.get_shape().as_list()[-1]
     residual = input_
     for i in range(2):
@@ -609,7 +572,7 @@ def make_u_enc(input_, n_layers):
 
     pf = np.log2(input_.get_shape().as_list()[-1])
     maxf = 512
-    nblocks = 2
+    nblocks = 1
 
     features = input_
     for i in range(n_layers):
@@ -627,6 +590,7 @@ def make_u_enc(input_, n_layers):
 
 
 def by_shape(inputs):
+    """Arrange inputs by shape in dict."""
     bs = dict()
     for x in inputs:
         shape = x.get_shape().as_list()[1]
@@ -653,7 +617,7 @@ def make_u_dec(inputs):
 
     pf = np.log2(in_by_shape[max_shape][0].get_shape().as_list()[-1])
     maxf = 512
-    nblocks = 2
+    nblocks = 1
 
     print(in_by_shape)
     fshapes = []
@@ -685,7 +649,7 @@ def make_enc(input_, power_features, n_layers):
     acti_op = lambda x: tf_activate(x, "leakyrelu")
 
     maxf = 512
-    nblocks = 2
+    nblocks = 1
 
     n_features = min(maxf, 2**power_features)
     features = input_
@@ -711,7 +675,7 @@ def make_dec(input_, n_layers, out_channels = 3):
     tanh_op = lambda x: tf_activate(x, "tanh")
 
     maxf = 512
-    nblocks = 2
+    nblocks = 1
 
     # build top down
     n_features = input_.get_shape().as_list()[-1]
@@ -800,7 +764,7 @@ class Model(object):
 
     def make_u_enc(self, name):
         return make_model(name, make_u_enc,
-                n_layers = 4)
+                n_layers = 3)
 
 
     def make_u_dec(self, name):
