@@ -1,5 +1,7 @@
 ## Generative Modeling of Humans conditioned on Pose
 
+![examples](assets/example.png)
+
 ### Usage
 
 #### Data preparation
