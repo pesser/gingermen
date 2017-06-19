@@ -2,6 +2,8 @@
 
 ![examples](assets/example.png)
 
+![video](assets/video.gif)
+
 ### Usage
 
 #### Data preparation
